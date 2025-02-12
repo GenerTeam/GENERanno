@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img alt="Gener" src="figures/logo.jpg" width=50%>
+    <img alt="Gener" src="figures/logo.png" width=50%>
   </picture>
 </p>
 
