@@ -4,7 +4,7 @@
   </picture>
 </p>
 
-<h2 align="center">GENERanno: A Unified Genomic Foundation Model with Specialization in Gene Annotation</h2>
+<h1 align="center">GENERanno: A Unified Genomic Foundation Model with Specialization in Gene Annotation</h1>
 
 ## 📰 News
 * 🤗 **[2025-02-11]** We are pleased to announce that our models `GENERanno-prokaryote-0.5b-base`, `GENERanno-eukaryote-0.5b-base` are now available on [Hugging Face](https://huggingface.co/GenerTeam/)!
