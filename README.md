@@ -4,7 +4,7 @@
   </picture>
 </p>
 
-<h1 align="center">GENERanno: A Unified Genomic Foundation Model with Specialization in Gene Annotation</h1>
+<h1 align="center">GENERanno: A Genomic Foundation Model for Metagenomics Annotation</h1>
 
 ## 📰 News
 
