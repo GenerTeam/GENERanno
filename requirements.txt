@@ -1,0 +1,6 @@
+transformers[torch]==4.49.0
+huggingface_hub
+datasets<3.0.0
+scikit-learn
+deepspeed
+wandb
