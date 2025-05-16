@@ -315,7 +315,7 @@ def setup_dataset(
         remove_columns=[
             col
             for col in dataset["train"].column_names
-            if col not in ["input_ids", "label"]
+            if col not in ["input_ids", "attention_mask", "label"]
         ],
     )
 
