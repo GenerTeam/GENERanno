@@ -40,7 +40,12 @@ In this repository, you will find the following model checkpoints:
 
 ## 📈 Benchmark Performance
 
-![benchmark](figures/benchmarks.png)
+### Coding DNA Sequence (CDS) Annotation
+![bacteria_annotation_summary](figures/bacteria_annotation_summary.png)
+![archaea_annotation_summary](figures/archaea_annotation_summary.png)
+
+### Sequence Understanding (Classification/Regression)
+![benchmarks](figures/benchmarks.png)
 
 ## 🎯 Quick Start
 
@@ -87,12 +92,12 @@ python src/tasks/downstream/cds_annotation.py --dp_size ${NUM_GPUS}
 #### Sequence Understanding (Classification/Regression)
 
 To run the sequence understanding task
-on [Gener Tasks](https://huggingface.co/datasets/GenerTeam/gener-tasks), [NT Tasks](https://huggingface.co/datasets/InstaDeepAI/nucleotide_transformer_downstream_tasks_revised), [Genomic Benchmarks](https://huggingface.co/katarinagresova), [DeepSTARR Enhancer](https://huggingface.co/datasets/GenerTeam/DeepSTARR-enhancer-activity),
+on [Gener Tasks](https://huggingface.co/datasets/GenerTeam/gener-tasks), [Prokaryotic Gener Tasks](https://huggingface.co/datasets/GenerTeam/prokaryotic-gener-tasks), [NT Tasks](https://huggingface.co/datasets/InstaDeepAI/nucleotide_transformer_downstream_tasks_revised), [Genomic Benchmarks](https://huggingface.co/katarinagresova), [DeepSTARR Enhancer](https://huggingface.co/datasets/GenerTeam/DeepSTARR-enhancer-activity),
 you can use the following arguments:
 
-* Gener Tasks
-    * `--dataset_name GenerTeam/gener-tasks`
-    * `--subset_name gene_classification` or `--subset_name taxonomic_classification`
+* Gener Tasks / Prokaryotic Gener Tasks
+    * `--dataset_name GenerTeam/gener-tasks` or `--dataset_name GenerTeam/prokaryotic-gener-tasks`
+    * `--subset_name gene_classification` or `--subset_name taxonomic_classification` or ...
 * NT Tasks
     * `--dataset_name InstaDeepAI/nucleotide_transformer_downstream_tasks_revised`
     * `--subset_name H2AFZ` or `--subset_name H3K27ac` or ...
