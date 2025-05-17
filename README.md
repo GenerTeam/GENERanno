@@ -41,12 +41,12 @@ In this repository, you will find the following model checkpoints:
 
 ## 📈 Benchmark Performance
 
-### Coding DNA Sequence (CDS) Annotation
+### Coding DNA Sequence (CDS) Annotation — `GENERanno-prokaryote-0.5b-cds-annotator-preview`
 ![bacteria_annotation_summary](figures/bacteria_annotation_summary.png)
 ![archaea_annotation_summary](figures/archaea_annotation_summary.png)
 The detailed annotation results are provived [here](https://huggingface.co/datasets/GenerTeam/cds-annotation).
 
-### Sequence Understanding (Classification/Regression)
+### Sequence Understanding (Classification/Regression) — `GENERanno-eukaryote-0.5b-base`
 ![benchmarks](figures/benchmarks.png)
 
 ## 🎯 Quick Start
