@@ -43,6 +43,7 @@ In this repository, you will find the following model checkpoints:
 ### Coding DNA Sequence (CDS) Annotation
 ![bacteria_annotation_summary](figures/bacteria_annotation_summary.png)
 ![archaea_annotation_summary](figures/archaea_annotation_summary.png)
+The detailed annotation results are provived [here](https://huggingface.co/datasets/GenerTeam/cds-annotation).
 
 ### Sequence Understanding (Classification/Regression)
 ![benchmarks](figures/benchmarks.png)
