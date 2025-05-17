@@ -4,10 +4,11 @@
   </picture>
 </p>
 
-<h1 align="center">GENERanno: A Genomic Foundation Model for Metagenomics Annotation</h1>
+<h1 align="center">GENERanno: A Genomic Foundation Model for Metagenomic Annotation</h1>
 
 ## 📰 News
 
+* 🤗 **[2025-02-11]** Our expert model for metagenomic annotation `GENERanno-prokaryote-0.5b-cds-annotator-preview` is now available on [Hugging Face](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator-preview)!
 * 🤗 **[2025-02-11]** We are pleased to announce that our models `GENERanno-prokaryote-0.5b-base`,
   `GENERanno-eukaryote-0.5b-base` are now available on [Hugging Face](https://huggingface.co/GenerTeam/)!
 
