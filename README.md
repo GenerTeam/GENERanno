@@ -8,7 +8,7 @@
 
 ## 📰 News
 
-* 🤗 **[2025-02-11]** Our expert model for metagenomic annotation `GENERanno-prokaryote-0.5b-cds-annotator-preview` is now available on [Hugging Face](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator-preview)!
+* 🤗 **[2025-05-10]** Our expert model for metagenomic annotation `GENERanno-prokaryote-0.5b-cds-annotator-preview` is now available on [Hugging Face](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator-preview)!
 * 🤗 **[2025-02-11]** We are pleased to announce that our models `GENERanno-prokaryote-0.5b-base`,
   `GENERanno-eukaryote-0.5b-base` are now available on [Hugging Face](https://huggingface.co/GenerTeam/)!
 
@@ -46,8 +46,11 @@ In this repository, you will find the following model checkpoints:
 ![archaea_annotation_summary](figures/archaea_annotation_summary.png)
 The detailed annotation results are provived [here](https://huggingface.co/datasets/GenerTeam/cds-annotation).
 
+### Sequence Understanding (Classification/Regression) — `GENERanno-prokaryote-0.5b-base`
+![benchmarks](figures/prokaryotic_gener_tasks.png)
+
 ### Sequence Understanding (Classification/Regression) — `GENERanno-eukaryote-0.5b-base`
-![benchmarks](figures/benchmarks.png)
+![benchmarks](figures/eukaryotic_benchmarks.png)
 
 ## 🎯 Quick Start
 
