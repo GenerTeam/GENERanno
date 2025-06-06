@@ -145,7 +145,8 @@ torchrun --nnodes=${NUM_NODES} \
 
 ## 📚 Datasets
 
-coming soon...
+* [Prokaryotic Gener Tasks](https://huggingface.co/datasets/GenerTeam/prokaryotic-gener-tasks)
+* [CDS Annotation](https://huggingface.co/datasets/GenerTeam/cds-annotation)
 
 ## 📜 Citation
 
