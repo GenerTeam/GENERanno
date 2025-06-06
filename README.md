@@ -151,13 +151,14 @@ torchrun --nnodes=${NUM_NODES} \
 ## 📜 Citation
 
 ```
-@misc{wu2025generator,
-      title={GENERator: A Long-Context Generative Genomic Foundation Model}, 
-      author={Wei Wu and Qiuyi Li and Mingyang Li and Kun Fu and Fuli Feng and Jieping Ye and Hui Xiong and Zheng Wang},
-      year={2025},
-      eprint={2502.07272},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2502.07272}, 
+@article {li2025generanno,
+	author = {Li, Qiuyi and Wu, Wei and Zhu, Yiheng and Feng, Fuli and Ye, Jieping and Wang, Zheng},
+	title = {GENERanno: A Genomic Foundation Model for Metagenomic Annotation},
+	elocation-id = {2025.06.04.656517},
+	year = {2025},
+	doi = {10.1101/2025.06.04.656517},
+	publisher = {Cold Spring Harbor Laboratory},
+	URL = {https://www.biorxiv.org/content/early/2025/06/05/2025.06.04.656517},
+	journal = {bioRxiv}
 }
 ```
