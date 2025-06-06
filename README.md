@@ -74,10 +74,6 @@ pip install -r requirements.txt
 > export HF_ENDPOINT=https://hf-mirror.com
 > ```
 
-### Pre-train
-
-coming soon...
-
 ### Downstream
 
 #### Coding DNA Sequence (CDS) Annotation
