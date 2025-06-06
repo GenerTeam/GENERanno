@@ -151,7 +151,7 @@ torchrun --nnodes=${NUM_NODES} \
 ## 📜 Citation
 
 ```
-@article {li2025generanno,
+@article{li2025generanno,
 	author = {Li, Qiuyi and Wu, Wei and Zhu, Yiheng and Feng, Fuli and Ye, Jieping and Wang, Zheng},
 	title = {GENERanno: A Genomic Foundation Model for Metagenomic Annotation},
 	elocation-id = {2025.06.04.656517},
