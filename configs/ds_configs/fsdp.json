@@ -1,0 +1,12 @@
+{
+  "auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+  "backward_prefetch_policy": "BACKWARD_PRE",
+  "cpu_ram_efficient_loading": "true",
+  "forward_prefetch": "false",
+  "offload_params": "false",
+  "sharding_strategy": "SHARD_GRAD_OP",
+  "state_dict_type": "SHARDED_STATE_DICT",
+  "sync_module_states": "true",
+  "transformer_layer_cls_to_wrap": "LlamaDecoderLayer",
+  "use_orig_params": "true"
+}
