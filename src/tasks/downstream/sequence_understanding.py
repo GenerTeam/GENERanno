@@ -96,7 +96,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--model_name",
         type=str,
-        default="GenerTeam/GENERator-eukaryote-1.2b-base",
+        default="GenerTeam/GENERanno-prokaryote-0.5b-base",
         help="HuggingFace model path or name",
     )
     parser.add_argument(
@@ -108,7 +108,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--max_length",
         type=int,
-        default=16384,
+        default=8192,
         help="Maximum sequence length for tokenization",
     )
     parser.add_argument(
@@ -191,7 +191,7 @@ def setup_dataset(
     dataset_name: str,
     subset_name: Optional[str] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
-    max_length: int = 16384,
+    max_length: int = 8192,
     problem_type: str = "single_label_classification",
     seed: int = 42,
     num_folds: int = 0,
