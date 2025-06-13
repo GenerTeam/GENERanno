@@ -776,14 +776,11 @@ def evaluate_model(trainer: Trainer, test_dataset: Dataset) -> Dict[str, float]:
     start_time = time.time()
 
     # Run evaluation
-    test_results = trainer.evaluate(test_dataset)
+    test_results = trainer.evaluate(test_dataset, metric_key_prefix="test")
 
     dist_print(f"⏱️ Evaluation completed in {time.time() - start_time:.2f} seconds")
 
-    # Prepare readable results
-    metrics = {k.replace("eval_", "test_"): v for k, v in test_results.items()}
-
-    return metrics
+    return test_results
 
 
 def save_model(
