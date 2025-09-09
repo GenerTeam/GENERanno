@@ -43,7 +43,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--model_name",
         type=str,
-        default="GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator-preview",
+        default="GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator",
         help="HuggingFace model path or name",
     )
     parser.add_argument(
