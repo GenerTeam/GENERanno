@@ -14,16 +14,14 @@ from transformers import (
     AutoModelForTokenClassification,
 )
 
+# Constants for label mapping
 LABEL2CHAR = {
-    "CDS+": "+",
-    "PSEUDO+": "+",
-    "CDS-": "-",
-    "PSEUDO-": "-",
-    "NON_CODING": "_",
+    "CDS": "+",
+    "NON_CODING": "-",
 }
 
 # Mapping for numeric representation in parquet
-CHAR2NUM = {"+": 1, "-": -1, "_": 0}
+CHAR2NUM = {"+": 1, "-": 0}
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -91,30 +89,31 @@ def setup_model(
     start_time = time.time()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    dtype = "bfloat16" if torch.cuda.get_device_capability()[0] >= 8 else "float32"
+    dtype_str = "bfloat16" if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else "float32"
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name, torch_dtype=dtype, trust_remote_code=True
+        model_name, torch_dtype=getattr(torch, dtype_str), trust_remote_code=True
     )
 
     # Check available GPUs
+    device = torch.device("cpu")
     if torch.cuda.is_available():
         available_gpus = torch.cuda.device_count()
         if dp_size > 1 and available_gpus >= dp_size:
             print(f"🚀 Using DataParallel with {dp_size} GPUs")
             model = torch.nn.DataParallel(model, device_ids=list(range(dp_size)))
             device = torch.device("cuda")
-        else:
+        elif dp_size > 1:
+            print(f"⚠️ Requested {dp_size} GPUs but only {available_gpus} available")
+            print(f"🔄 Using single GPU: {torch.cuda.get_device_name(0)}")
             device = torch.device("cuda:0")
-            if dp_size > 1:
-                print(f"⚠️ Requested {dp_size} GPUs but only {available_gpus} available")
-                print(f"🔄 Using single GPU: {torch.cuda.get_device_name(0)}")
-            else:
-                print(f"💻 Using single GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print(f"💻 Using single GPU: {torch.cuda.get_device_name(0)}")
+            device = torch.device("cuda:0")
     else:
-        device = torch.device("cpu")
         print("⚠️ No GPU available, using CPU")
 
     model.to(device)
+    model.eval()
     print(f"⏱️ Model loading completed in {time.time() - start_time:.2f} seconds")
 
     # Print model info
@@ -136,7 +135,7 @@ def _parse_fasta_from_stream(stream: IO[str]) -> List[Tuple[str, str]]:
     """
     records, header, seq_lines = [], None, []
     for line in stream:
-        line = line.rstrip()
+        line = line.strip()
         if line.startswith(">"):
             if header is not None:
                 records.append((header, "".join(seq_lines).upper()))
@@ -205,7 +204,7 @@ def write_fasta(records: List[Tuple[str, str]], path: str, width: int = 60) -> N
         width: Line width for sequences (default: 60)
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for header, seq in records:
             f.write(header + "\n")
             for i in range(0, len(seq), width):
@@ -213,28 +212,43 @@ def write_fasta(records: List[Tuple[str, str]], path: str, width: int = 60) -> N
     print(f"✅ Annotated FASTA written to {path}")
 
 
-def write_parquet(records: List[Tuple[str, str]], path: str) -> None:
+def write_parquet(
+    all_head_records: List[List[Tuple[str, str]]], head_names: List[str], path: str
+) -> None:
     """
     Write annotations to a parquet file with record name and numeric predictions.
 
     Args:
-        records: List of (header, annotation) tuples
-        path: Output parquet file path
+        all_head_records: A list where each item is the list of records for a head.
+        head_names: A list of names for each prediction head.
+        path: Output parquet file path.
     """
-    # Extract record names and convert annotations to numeric format
+    if not all_head_records:
+        print("⚠️ No records to write to Parquet.")
+        return
+
     data = []
-    for header, annotation in records:
-        # Extract record name from the header (removing '>')
+    num_records = len(all_head_records[0])
+
+    # Iterate through each sequence record
+    for i in range(num_records):
+        # Extract record name from the first head's record (it's the same for all)
+        header, _ = all_head_records[0][i]
         record_name = (
             header[1:].split()[0] if header.startswith(">") else header.split()[0]
         )
+        row_data = {"record_name": record_name}
 
-        # Convert annotations to numeric values
-        numeric_labels = [CHAR2NUM[char] for char in annotation]
+        # Add predictions from each head as a new column
+        for h, head_name in enumerate(head_names):
+            _, annotation = all_head_records[h][i]
+            # Use .get() for safety, defaulting to 0 for unknown characters
+            numeric_labels = [CHAR2NUM.get(char, 0) for char in annotation]
+            row_data[f"pred_{head_name}"] = numeric_labels
 
-        data.append({"record_name": record_name, "pred": numeric_labels})
+        data.append(row_data)
 
-    # Create DataFrame and save as parquet
+    # Create DataFrame and save as a single Parquet file
     df = pd.DataFrame(data)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     df.to_parquet(path, index=False)
@@ -249,7 +263,7 @@ def annotate_fasta(
     device: torch.device,
     max_length: int,
     micro_batch_size: int,
-) -> List[Tuple[str, str]]:
+) -> List[List[Tuple[str, str]]]:
     """
     Annotate sequences in FASTA format with gene predictions.
 
@@ -266,76 +280,78 @@ def annotate_fasta(
         micro_batch_size: Batch size for model inference
 
     Returns:
-        List of (header, annotation) tuples
+        A list of lists of (header, annotation) tuples. The outer list
+        corresponds to prediction heads, the inner list to records.
     """
     pad_id = tokenizer.pad_token_id
-    if isinstance(model, torch.nn.DataParallel):
-        id2label = model.module.config.id2label
-    else:
-        id2label = model.config.id2label
+    model_module = model.module if isinstance(model, torch.nn.DataParallel) else model
+    id2label = model_module.config.id2label
+    num_heads = getattr(model_module, "num_prediction_heads", 1)
+    print(f"🧬 Model has {num_heads} prediction head(s). Preparing sequences...")
 
-    print("🧬 Preparing sequences for annotation...")
-
-    # Step 1: Chunk every sequence and remember how many chunks each has
-    all_chunks: List[List[int]] = []
-    all_masks: List[List[int]] = []
-    chunk_counts: List[int] = []  # number of chunks per sequence
-    token_lens: List[int] = []  # true token length per sequence
-
+    # Step 1: Chunk all sequences
+    all_chunks, all_masks, token_lens = [], [], []
     for _, seq in records:
         ids = tokenizer(seq, add_special_tokens=False)["input_ids"]
         token_lens.append(len(ids))
-        cnt = 0
         while ids:
-            if len(ids) > max_length:
-                all_chunks.append(ids[:max_length])
-                all_masks.append([1] * max_length)
-                ids = ids[max_length:]
-            else:
-                pad_len = max_length - len(ids)
-                all_chunks.append(ids + [pad_id] * pad_len)
-                all_masks.append([1] * len(ids) + [0] * pad_len)
-                ids = []
-            cnt += 1
-        chunk_counts.append(cnt)
+            chunk = ids[:max_length]
+            ids = ids[max_length:]
+            pad_len = max_length - len(chunk)
+            all_chunks.append(chunk + [pad_id] * pad_len)
+            all_masks.append([1] * len(chunk) + [0] * pad_len)
 
     print(f"📏 Created {len(all_chunks)} chunks from {len(records)} sequences")
 
-    # Step 2: Run inference over the flattened chunk list
+    # Step 2: Run inference and separate predictions by head
     print("🧠 Running model inference...")
-    preds_flat: List[int] = []
+    preds_per_head_flat = [[] for _ in range(num_heads)]
+
     for start in tqdm(
         range(0, len(all_chunks), micro_batch_size),
         desc="Model inference",
         unit="batch",
     ):
         end = min(start + micro_batch_size, len(all_chunks))
-        inp = torch.tensor(all_chunks[start:end]).to(device)
-        att = torch.tensor(all_masks[start:end]).to(device)
+        inp = torch.tensor(all_chunks[start:end], dtype=torch.long).to(device)
+        att = torch.tensor(all_masks[start:end], dtype=torch.long).to(device)
 
         logits = model(input_ids=inp, attention_mask=att).logits
         preds = logits.argmax(dim=-1).cpu()
 
-        for i, m in enumerate(att.cpu()):
-            valid = int(m.sum())
-            preds_flat.extend(preds[i][:valid].tolist())
+        for i in range(preds.shape[0]):
+            mask = att[i].cpu()
+            valid_len = int(mask.sum())
 
-    # Step 3: Split predictions back per sequence, map to labels & chars
+            # The model concatenates head predictions, so we split them
+            total_pred_len = valid_len * num_heads
+            chunk_preds_all_heads = preds[i, :total_pred_len].tolist()
+
+            for h in range(num_heads):
+                start_idx = h * valid_len
+                end_idx = (h + 1) * valid_len
+                preds_per_head_flat[h].extend(chunk_preds_all_heads[start_idx:end_idx])
+
+    # Step 3: Reconstruct full sequence annotations for each head
     print("🔍 Generating annotations from predictions...")
-    annotated_records: List[Tuple[str, str]] = []
-    cursor = 0
-    for (header, seq), tok_len in zip(records, token_lens):
-        seq_preds = preds_flat[cursor : cursor + tok_len]
-        cursor += tok_len
+    all_annotated_records = []
+    for h in range(num_heads):
+        head_annotations = []
+        cursor = 0
+        for (header, seq), tok_len in zip(records, token_lens):
+            seq_preds = preds_per_head_flat[h][cursor : cursor + tok_len]
+            cursor += tok_len
 
-        labels = [id2label[i] for i in seq_preds]
-        annot = "".join(LABEL2CHAR[l] for l in labels)
-        assert len(annot) == len(seq), "Length mismatch after annotation"
+            labels = [id2label[i] for i in seq_preds]
+            annot = "".join(LABEL2CHAR[l] for l in labels)
 
-        annotated_records.append((header, annot))
+            assert len(annot) == len(seq)
 
-    print(f"✅ Successfully annotated {len(annotated_records)} sequences")
-    return annotated_records
+            head_annotations.append((header, annot))
+        all_annotated_records.append(head_annotations)
+
+    print(f"✅ Successfully generated annotations for {num_heads} head(s).")
+    return all_annotated_records
 
 
 def display_progress_header() -> None:
@@ -367,8 +383,7 @@ def main() -> None:
     # Setup model and tokenizer with specified DP size
     model, tokenizer, device = setup_model(args.model_name, args.dp_size)
 
-    # Annotate sequences
-    annotated_records = annotate_fasta(
+    annotated_records_per_head = annotate_fasta(
         fasta_records,
         model,
         tokenizer,
@@ -377,7 +392,14 @@ def main() -> None:
         micro_batch_size=args.batch_size,
     )
 
-    # Generate output filenames with timestamp
+    # Define names for each prediction head for output files
+    num_heads = len(annotated_records_per_head)
+    if num_heads == 2:
+        head_names = ["positive_strand", "negative_strand"]
+    else:
+        head_names = [f"head_{i}" for i in range(num_heads)]
+
+    # Generate output filenames with timestamp and write files for each head
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     input_filename = os.path.basename(args.input_fasta)
     base_input_name = os.path.splitext(input_filename)[0]
@@ -385,17 +407,22 @@ def main() -> None:
     # Create output directory if it doesn't exist
     os.makedirs(args.output_path, exist_ok=True)
 
-    # Construct output file paths
-    fasta_output_path = os.path.join(
-        args.output_path, f"{base_input_name}_{timestamp}.fasta"
-    )
-    parquet_output_path = os.path.join(
-        args.output_path, f"{base_input_name}_{timestamp}.parquet"
-    )
+    # --- Write separate FASTA file for each head ---
+    for head_name, annotated_records in zip(head_names, annotated_records_per_head):
+        print(f"\n--- Writing FASTA output for: {head_name} ---")
+        output_suffix = f"{timestamp}_{head_name}"
+        fasta_output_path = os.path.join(
+            args.output_path, f"{base_input_name}_{output_suffix}.fasta"
+        )
+        write_fasta(annotated_records, fasta_output_path)
 
-    # Write results to output files
-    write_fasta(annotated_records, fasta_output_path)
-    write_parquet(annotated_records, parquet_output_path)
+    # --- Write a single Parquet file with all heads as columns ---
+    if annotated_records_per_head:
+        print("\n--- Writing multi-head Parquet output ---")
+        parquet_output_path = os.path.join(
+            args.output_path, f"{base_input_name}_{timestamp}.parquet"
+        )
+        write_parquet(annotated_records_per_head, head_names, parquet_output_path)
 
     # Print total execution time
     total_time = time.time() - total_start_time
