@@ -1,11 +1,15 @@
+import os
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import argparse
 import datetime
-import os
 import time
 from typing import List, Tuple, Union, IO
+import math
 
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
@@ -38,27 +42,30 @@ def parse_arguments() -> argparse.Namespace:
         "--input_fasta",
         type=str,
         default="hf://datasets/GenerTeam/cds-annotation/examples/Bacillus_anthracis_plasmid.fasta",
-        help="Path to input FASTA to be annotated.",
+        help="Download from https://huggingface.co/datasets/GenerTeam/cds-annotation",
     )
     parser.add_argument(
         "--model_name",
         type=str,
         default="GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator",
-        help="HuggingFace model path or name",
+        help="Download from https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=4, help="Batch size for model inference"
+        "--batch_size", 
+        type=int, 
+        default=4, 
+        help="Batch size for model inference"
     )
     parser.add_argument(
-        "--dp_size",
+        "--gpu_count",
         type=int,
-        default=1,
-        help="Number of GPUs to use for DataParallel (1 for single GPU)",
+        default=-1,
+        help="Number of GPUs to use for parallel processing (-1 for all available GPUs)",
     )
     parser.add_argument(
         "--output_path",
         type=str,
-        default="./result",
+        default="./annotation_results",
         help="Directory to save the output predictions",
     )
     parser.add_argument(
@@ -67,58 +74,44 @@ def parse_arguments() -> argparse.Namespace:
         default=8192,
         help="Context length in base pairs (bp) for sequence extraction",
     )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Use bfloat16 for faster inference",
+    )
     return parser.parse_args()
 
 
-def setup_model(
-    model_name: str, dp_size: int = 1
-) -> Tuple[
-    Union[PreTrainedModel, torch.nn.DataParallel], PreTrainedTokenizer, torch.device
-]:
+def setup_model_for_gpu(
+    model_name: str, gpu_id: int, dtype_str: str
+) -> Tuple[PreTrainedModel, PreTrainedTokenizer, torch.device]:
     """
-    Load and setup the model with optional multi-GPU support.
+    Load and setup the model for a specific GPU.
 
     Args:
         model_name: Name or path of the HuggingFace model
-        dp_size: Number of GPUs to use for DataParallel (1 for single GPU)
+        gpu_id: GPU device ID to use
+        dtype_str: Data type string ('float32' or 'bfloat16')
 
     Returns:
         tuple of (model, tokenizer, device)
     """
-    print(f"🤗 Loading model from Hugging Face: {model_name}")
+    print(f"🤗 Loading model on GPU {gpu_id}: {model_name}")
     start_time = time.time()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    dtype_str = "bfloat16" if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else "float32"
     model = AutoModelForTokenClassification.from_pretrained(
         model_name, torch_dtype=getattr(torch, dtype_str), trust_remote_code=True
     )
 
-    # Check available GPUs
-    device = torch.device("cpu")
-    if torch.cuda.is_available():
-        available_gpus = torch.cuda.device_count()
-        if dp_size > 1 and available_gpus >= dp_size:
-            print(f"🚀 Using DataParallel with {dp_size} GPUs")
-            model = torch.nn.DataParallel(model, device_ids=list(range(dp_size)))
-            device = torch.device("cuda")
-        elif dp_size > 1:
-            print(f"⚠️ Requested {dp_size} GPUs but only {available_gpus} available")
-            print(f"🔄 Using single GPU: {torch.cuda.get_device_name(0)}")
-            device = torch.device("cuda:0")
-        else:
-            print(f"💻 Using single GPU: {torch.cuda.get_device_name(0)}")
-            device = torch.device("cuda:0")
-    else:
-        print("⚠️ No GPU available, using CPU")
-
+    device = torch.device(f"cuda:{gpu_id}" if gpu_id >= 0 else "cpu")
     model.to(device)
     model.eval()
-    print(f"⏱️ Model loading completed in {time.time() - start_time:.2f} seconds")
-
+    
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"📊 Model size: {total_params / 1e6:.1f}M parameters")
+    print(f"📊 Device {device} model size: {total_params / 1e6:.1f}M parameters")
+    print(f"⏱️ Model loading completed in {time.time() - start_time:.2f} seconds")
 
     return model, tokenizer, device
 
@@ -255,64 +248,85 @@ def write_parquet(
     print(f"✅ Parquet file written to {path}")
 
 
+def distribute_sequences_to_gpus(
+    records: List[Tuple[str, str]], gpu_count: int
+) -> List[List[Tuple[str, str]]]:
+    """
+    Distribute sequences evenly across GPUs.
+
+    Args:
+        records: List of (header, sequence) tuples
+        gpu_count: Number of GPUs to distribute across
+
+    Returns:
+        List of record lists, one for each GPU
+    """
+    sequences_per_gpu = math.ceil(len(records) / gpu_count)
+    gpu_sequences = []
+    
+    for gpu_id in range(gpu_count):
+        start_idx = gpu_id * sequences_per_gpu
+        end_idx = min(start_idx + sequences_per_gpu, len(records))
+        gpu_sequences.append(records[start_idx:end_idx])
+        print(f"📋 GPU {gpu_id} assigned {len(gpu_sequences[gpu_id])} sequences")
+    
+    return gpu_sequences
+
+
 @torch.no_grad()
-def annotate_fasta(
-    records: List[Tuple[str, str]],
-    model: Union[PreTrainedModel, torch.nn.DataParallel],
+def process_sequences_on_gpu(
+    sequences: List[Tuple[str, str]],
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     device: torch.device,
     max_length: int,
     micro_batch_size: int,
+    progress_bar: tqdm = None
 ) -> List[List[Tuple[str, str]]]:
     """
-    Annotate sequences in FASTA format with gene predictions.
-
-    Batched version -- all sequences are chunked first, then inferred in a
-    single loop of micro-batches. This mirrors the logic used in
-    NucleotideClassificationInferenceTask while avoiding per-record overhead.
+    Process sequences on a specific GPU.
 
     Args:
-        records: List of (header, sequence) tuples
+        sequences: List of (header, sequence) tuples to process
         model: The pre-trained model for sequence annotation
         tokenizer: Tokenizer for the model
         device: Computation device (CPU or GPU)
         max_length: Maximum sequence length for chunking
         micro_batch_size: Batch size for model inference
+        progress_bar: Optional progress bar to update
 
     Returns:
-        A list of lists of (header, annotation) tuples. The outer list
-        corresponds to prediction heads, the inner list to records.
+        A list of lists of (header, annotation) tuples for the sequences
     """
     pad_id = tokenizer.pad_token_id
-    model_module = model.module if isinstance(model, torch.nn.DataParallel) else model
-    id2label = model_module.config.id2label
-    num_heads = getattr(model_module, "num_prediction_heads", 1)
-    print(f"🧬 Model has {num_heads} prediction head(s). Preparing sequences...")
+    id2label = model.config.id2label
+    num_heads = getattr(model, "num_prediction_heads", 1)
 
-    # Step 1: Chunk all sequences
+    # Step 1: Prepare all sequences for this GPU
     all_chunks, all_masks, token_lens = [], [], []
-    for _, seq in records:
+    sequence_headers = []
+    
+    for header, seq in sequences:
+        sequence_headers.append(header)
         ids = tokenizer(seq, add_special_tokens=False)["input_ids"]
         token_lens.append(len(ids))
         while ids:
-            chunk = ids[:max_length]
+            chunk_seq = ids[:max_length]
             ids = ids[max_length:]
-            pad_len = max_length - len(chunk)
-            all_chunks.append(chunk + [pad_id] * pad_len)
-            all_masks.append([1] * len(chunk) + [0] * pad_len)
+            pad_len = max_length - len(chunk_seq)
+            all_chunks.append(chunk_seq + [pad_id] * pad_len)
+            all_masks.append([1] * len(chunk_seq) + [0] * pad_len)
 
-    print(f"📏 Created {len(all_chunks)} chunks from {len(records)} sequences")
-
-    # Step 2: Run inference and separate predictions by head
-    print("🧠 Running model inference...")
+    # Step 2: Run inference for sequences on this GPU
     preds_per_head_flat = [[] for _ in range(num_heads)]
 
-    for start in tqdm(
-        range(0, len(all_chunks), micro_batch_size),
-        desc="Model inference",
-        unit="batch",
-    ):
-        end = min(start + micro_batch_size, len(all_chunks))
+    # Calculate how many sequences are processed in each batch
+    # This is approximate since batches contain chunks, not whole sequences
+    sequences_processed = 0
+    total_chunks = len(all_chunks)
+    
+    for start in range(0, total_chunks, micro_batch_size):
+        end = min(start + micro_batch_size, total_chunks)
         inp = torch.tensor(all_chunks[start:end], dtype=torch.long).to(device)
         att = torch.tensor(all_masks[start:end], dtype=torch.long).to(device)
 
@@ -332,13 +346,30 @@ def annotate_fasta(
                 end_idx = (h + 1) * valid_len
                 preds_per_head_flat[h].extend(chunk_preds_all_heads[start_idx:end_idx])
 
-    # Step 3: Reconstruct full sequence annotations for each head
-    print("🔍 Generating annotations from predictions...")
-    all_annotated_records = []
+        # Update progress bar if provided
+        if progress_bar is not None:
+            # Estimate progress based on chunks processed
+            # Each batch processes multiple chunks, but we want sequence-level progress
+            # We update more frequently for better visual feedback
+            chunks_processed = min(end, total_chunks)
+            progress_fraction = chunks_processed / total_chunks
+            target_sequences = int(progress_fraction * len(sequences))
+            if target_sequences > sequences_processed:
+                progress_bar.update(target_sequences - sequences_processed)
+                sequences_processed = target_sequences
+
+    # Step 3: Reconstruct annotations for sequences on this GPU
+    if progress_bar is not None:
+        # Ensure progress bar reaches 100%
+        remaining = len(sequences) - sequences_processed
+        if remaining > 0:
+            progress_bar.update(remaining)
+    
+    gpu_annotated_records = []
     for h in range(num_heads):
         head_annotations = []
         cursor = 0
-        for (header, seq), tok_len in zip(records, token_lens):
+        for header, (_, seq), tok_len in zip(sequence_headers, sequences, token_lens):
             seq_preds = preds_per_head_flat[h][cursor : cursor + tok_len]
             cursor += tok_len
 
@@ -346,11 +377,167 @@ def annotate_fasta(
             annot = "".join(LABEL2CHAR[l] for l in labels)
 
             assert len(annot) == len(seq)
-
             head_annotations.append((header, annot))
-        all_annotated_records.append(head_annotations)
+        gpu_annotated_records.append(head_annotations)
 
-    print(f"✅ Successfully generated annotations for {num_heads} head(s).")
+    return gpu_annotated_records
+
+
+def worker_process(
+    gpu_id: int,
+    model_name: str,
+    dtype_str: str,
+    sequences: List[Tuple[str, str]],
+    max_length: int,
+    micro_batch_size: int,
+    result_queue: mp.Queue,
+    progress_queue: mp.Queue,
+):
+    """
+    Worker process that runs on a specific GPU.
+
+    Args:
+        gpu_id: GPU device ID to use
+        model_name: HuggingFace model name
+        sequences: List of sequences to process on this GPU
+        max_length: Maximum sequence length
+        micro_batch_size: Batch size for inference
+        result_queue: Queue to put results in
+        progress_queue: Queue to report progress
+    """
+    try:
+        # Setup model for this GPU
+        model, tokenizer, device = setup_model_for_gpu(model_name, gpu_id, dtype_str)
+        
+        # Process sequences assigned to this GPU (no progress bar in worker processes)
+        gpu_results = process_sequences_on_gpu(
+            sequences, model, tokenizer, device, max_length, micro_batch_size, progress_bar=None
+        )
+        result_queue.put((gpu_id, gpu_results))
+        progress_queue.put(len(sequences))  # Report number of processed sequences
+            
+    except Exception as e:
+        print(f"❌ Error in GPU {gpu_id} worker: {e}")
+        result_queue.put(("error", gpu_id, str(e)))
+
+
+def annotate_fasta(
+    records: List[Tuple[str, str]],
+    model_name: str,
+    dtype_str: str,
+    gpu_count: int,
+    max_length: int,
+    micro_batch_size: int,
+) -> List[List[Tuple[str, str]]]:
+    """
+    Annotate sequences using single or multiple GPUs with independent model loading.
+
+    Args:
+        records: List of (header, sequence) tuples
+        model_name: HuggingFace model name
+        dtype_str: Data type string
+        gpu_count: Number of GPUs to use (1 for single GPU)
+        max_length: Maximum sequence length
+        micro_batch_size: Batch size for inference
+
+    Returns:
+        A list of lists of (header, annotation) tuples
+    """
+    # Single GPU case - process directly with sequence-level progress bar
+    if gpu_count <= 1:
+        if torch.cuda.is_available() and gpu_count == 1:
+            print("💻 Using single GPU processing")
+            gpu_id = 0
+        else:
+            print("💻 Using single CPU processing. This could be SLOW!!!")
+            gpu_id = -1
+        
+        model, tokenizer, device = setup_model_for_gpu(model_name, gpu_id, dtype_str)
+        
+        print(f"🧬 Processing {len(records)} sequences on {device}")
+        
+        # For single GPU, we use a sequence-level progress bar
+        with tqdm(total=len(records), desc="Processing sequences", unit="seq") as pbar:
+            # Pass the progress bar to the processing function
+            results = process_sequences_on_gpu(
+                records, model, tokenizer, device, max_length, micro_batch_size, progress_bar=pbar
+            )
+        
+        return results
+    
+    # Multi-GPU case - use multiprocessing (保持原有代码不变)
+    print(f"🚀 Starting parallel processing with {gpu_count} GPUs")
+    print(f"📊 Distributing {len(records)} sequences across {gpu_count} GPUs")
+
+    # Distribute sequences evenly across GPUs
+    gpu_sequences = distribute_sequences_to_gpus(records, gpu_count)
+
+    # Create queues for results and progress
+    result_queue = mp.Queue()
+    progress_queue = mp.Queue()
+
+    # Start worker processes
+    processes = []
+    for gpu_id in range(gpu_count):
+        if gpu_id < len(gpu_sequences) and gpu_sequences[gpu_id]:
+            p = mp.Process(
+                target=worker_process,
+                args=(
+                    gpu_id,
+                    model_name,
+                    dtype_str,
+                    gpu_sequences[gpu_id],
+                    max_length,
+                    micro_batch_size,
+                    result_queue,
+                    progress_queue,
+                ),
+            )
+            p.start()
+            processes.append(p)
+
+    # Collect results with progress bar
+    total_sequences = len(records)
+    results = [None] * gpu_count  # Store results by GPU ID
+    
+    with tqdm(total=total_sequences, desc="Processing sequences", unit="seq") as pbar:
+        completed = 0
+        while completed < total_sequences:
+            # Update progress from progress queue
+            while not progress_queue.empty():
+                processed_count = progress_queue.get()
+                pbar.update(processed_count)
+                completed += processed_count
+            
+            # Check for results
+            if not result_queue.empty():
+                gpu_id, gpu_results = result_queue.get()
+                if gpu_id == "error":
+                    print(f"❌ Worker error: {gpu_results}")
+                    continue
+                
+                results[gpu_id] = gpu_results
+            
+            time.sleep(0.1)  # Small delay to prevent busy waiting
+
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+
+    # Combine results from all GPUs in order
+    print("🔗 Combining results from all GPUs...")
+    
+    # Initialize empty lists for each head
+    num_heads = len(results[0]) if results[0] is not None else 0
+    all_annotated_records = [[] for _ in range(num_heads)]
+    
+    # Combine results in GPU order (which corresponds to sequence order)
+    for gpu_id in range(gpu_count):
+        if results[gpu_id] is not None:
+            for head_idx in range(num_heads):
+                all_annotated_records[head_idx].extend(results[gpu_id][head_idx])
+
+    print(f"✅ Successfully processed {len(records)} sequences across {gpu_count} GPUs")
     return all_annotated_records
 
 
@@ -376,18 +563,28 @@ def main() -> None:
     # Parse command line arguments
     args = parse_arguments()
 
+    dtype_str = "bfloat16" if args.bf16 else "float32"
+    print(f"📊 Using dtype: {dtype_str}")
+
     # Read input FASTA file
     print("🔄 Reading input FASTA file...")
     fasta_records = read_fasta(args.input_fasta)
 
-    # Setup model and tokenizer with specified DP size
-    model, tokenizer, device = setup_model(args.model_name, args.dp_size)
+    # Determine GPU count
+    available_gpus = torch.cuda.device_count()
+    if args.gpu_count == -1:
+        gpu_count = available_gpus
+    else:
+        gpu_count = min(args.gpu_count, available_gpus)
+    
+    print(f"🎯 Using {gpu_count} GPU(s) out of {available_gpus} available")
 
+    # Use unified annotate function for both single and multi-GPU
     annotated_records_per_head = annotate_fasta(
         fasta_records,
-        model,
-        tokenizer,
-        device,
+        args.model_name,
+        dtype_str,
+        gpu_count,
         max_length=args.context_length,
         micro_batch_size=args.batch_size,
     )
@@ -432,4 +629,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Set multiprocessing start method
+    mp.set_start_method('spawn', force=True)
     main()
