@@ -41,7 +41,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--input_fasta",
         type=str,
-        default="hf://datasets/GenerTeam/cds-annotation/examples/Bacillus_anthracis_plasmid.fasta",
+        default="hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta",
         help="Download from https://huggingface.co/datasets/GenerTeam/cds-annotation",
     )
     parser.add_argument(
@@ -607,7 +607,7 @@ def main() -> None:
     # --- Write separate FASTA file for each head ---
     for head_name, annotated_records in zip(head_names, annotated_records_per_head):
         print(f"\n--- Writing FASTA output for: {head_name} ---")
-        output_suffix = f"{timestamp}_{head_name}"
+        output_suffix = f"{dtype_str}_{head_name}"
         fasta_output_path = os.path.join(
             args.output_path, f"{base_input_name}_{output_suffix}.fasta"
         )
@@ -617,7 +617,7 @@ def main() -> None:
     if annotated_records_per_head:
         print("\n--- Writing multi-head Parquet output ---")
         parquet_output_path = os.path.join(
-            args.output_path, f"{base_input_name}_{timestamp}.parquet"
+            args.output_path, f"{base_input_name}_{dtype_str}.parquet"
         )
         write_parquet(annotated_records_per_head, head_names, parquet_output_path)
 
