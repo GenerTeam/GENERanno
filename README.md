@@ -92,7 +92,7 @@ python src/tasks/downstream/cds_annotation.py
 python src/tasks/downstream/cds_annotation.py --gpu_count ${NUM_GPUS}
 
 # BF16 for faster inference (recommended if supported)
-python src/tasks/downstream/variant_effect_prediction.py --bf16
+python src/tasks/downstream/cds_annotation.py --bf16
 ```
 Note: BF16 provides faster inference with minimal accuracy impact on supported hardware.
 
