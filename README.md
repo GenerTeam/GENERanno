@@ -37,10 +37,9 @@ In this repository, you will find the following model checkpoints:
 
 | Model Name                       | Parameters | Data |     Category     |                    Status                     |
 |----------------------------------|:----------:|:----:|:----------------:|:---------------------------------------------:|
-| `GENERanno-eukaryote-0.5b-base`  |    0.5B    | 386B |    Eukaryote     | [Available](https://huggingface.co/GenerTeam) |
-| `GENERanno-prokaryote-0.5b-base` |    0.5B    | 715B |    Prokaryote    | [Available](https://huggingface.co/GenerTeam) |
-| `GENERanno-eukaryote-1b-base`    |     1B     | 386B |    Eukaryote     |             Awaiting sponsorship              |
-| `GENERanno-prokaryote-1b-base`   |     1B     | 715B |    Prokaryote    |             Awaiting sponsorship              |
+| `GENERanno-eukaryote-0.5b-base`  |    0.5B    | 386B |    Eukaryote     | [Available](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-eukaryote-base) |
+| `GENERanno-prokaryote-0.5b-base` |    0.5B    | 715B |    Prokaryote    | [Available](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-prokaryote-base) |
+| `GENERanno-prokaryote-0.5b-cds-annotator` |     0.5B     | 890B |    Prokaryote    |[Available](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator)|
 
 ## 📈 Benchmark Performance
 
