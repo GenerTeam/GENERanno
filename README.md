@@ -85,7 +85,7 @@ our [cds annotation dataset](https://huggingface.co/datasets/GenerTeam/cds-annot
 following command:
 
 ```shell
-# Using all available GPUs on the node (default)
+# Using all available GPUs (default)
 python src/tasks/downstream/cds_annotation.py
 
 # Using specific number of GPUs
