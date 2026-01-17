@@ -85,11 +85,11 @@ our [cds annotation dataset](https://huggingface.co/datasets/GenerTeam/cds-annot
 following command:
 
 ```shell
-# Using single GPU
+# Using all available GPUs on the node (default)
 python src/tasks/downstream/cds_annotation.py
 
-# Using multiple GPUs (Data Parallel)
-python src/tasks/downstream/cds_annotation.py --dp_size ${NUM_GPUS}
+# Using specific number of GPUs
+python src/tasks/downstream/cds_annotation.py --gpu_count ${NUM_GPUS}
 ```
 
 #### Sequence Understanding (Classification/Regression)
