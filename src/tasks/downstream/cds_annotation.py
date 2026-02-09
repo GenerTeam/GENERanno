@@ -27,106 +27,72 @@ LABEL2CHAR = {
 # Mapping for numeric representation in parquet
 CHAR2NUM = {"+": 1, "-": 0}
 
+PRESET_DEFAULTS = {
+    "eukaryote": {
+        "input": ["hf://datasets/GenerTeam/cds-annotation/examples/fly_GCF_000001215.4.parquet"],
+        "model_name": "GenerTeam/GENERanno-eukaryote-1.2b-cds-annotator-preview",
+        "output_path": "./eukaryote_annotation_results",
+        "context_length": 16384,
+        "overlap_length": 1024,
+        "postprocess_stair_max_shift": 64,
+        "postprocess_stair_inner_shift": 16,
+        "postprocess_stair_min_drop": 0.1,
+        "postprocess_min_length": 4,
+    },
+    "prokaryote": {
+        "input": ["hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta"],
+        "model_name": "GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator",
+        "output_path": "./prokaryote_annotation_results",
+        "context_length": 8192,
+        "overlap_length": 512,
+        "postprocess_stair_max_shift": 64,
+        "postprocess_stair_inner_shift": 16,
+        "postprocess_stair_min_drop": 0.1,
+        "postprocess_min_length": 4,
+    },
+}
 
 def parse_arguments() -> argparse.Namespace:
     """
-    Parse command line arguments for coding DNA sequence (CDS) annotation.
-
-    Returns:
-        Parsed arguments namespace
+    Parse command line arguments for CDS annotation.
+    All defaults are provided via organism-specific presets.
     """
+
+    # ---- Pass 1: require organism to select preset ----
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--organism",
+        type=str,
+        choices=list(PRESET_DEFAULTS.keys()),
+        required=True,
+        help="Select which preset configuration to use.",
+    )
+    pre_args, _ = pre_parser.parse_known_args()
+    d = PRESET_DEFAULTS[pre_args.organism]
+
+    # ---- Pass 2: full parser ----
     parser = argparse.ArgumentParser(
-        description="Downstream Task: Coding DNA Sequence (CDS) Annotation."
+        description="Downstream Task: Coding DNA Sequence (CDS) Annotation.",
+        parents=[pre_parser],
     )
-    parser.add_argument(
-        "--input",
-        type=str,
-        nargs="+",
-        default=["hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta"],
-        help=(
-            "One or more input sources (FASTA/Parquet files, or directories). "
-            "Directory inputs will expand to FASTA/Parquet files in sorted order."
-        ),
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator",
-        help="HuggingFace model path or name",
-    )
-    parser.add_argument(
-        "--batch_size", 
-        type=int, 
-        default=4, 
-        help="Batch size for model inference"
-    )
-    parser.add_argument(
-        "--gpu_count",
-        type=int,
-        default=-1,
-        help="Number of GPUs to use for parallel processing (-1 for all available GPUs)",
-    )
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        default="./annotation_results",
-        help="Directory to save the output predictions",
-    )
-    parser.add_argument(
-        "--context_length",
-        type=int,
-        default=16384,
-        help="Context length in tokens for sequence extraction",
-    )
-    parser.add_argument(
-        "--overlap_length",
-        type=int,
-        default=1024,
-        help="Overlap length in tokens for sequence extraction",
-    )
-    parser.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Use bfloat16 for faster inference",
-    )
-    parser.add_argument(
-        "--no_postprocess",
-        action="store_true",
-        help="Disable stair-refine postprocess and use pure argmax outputs.",
-    )
-    parser.add_argument(
-        "--postprocess_stair_max_shift",
-        type=int,
-        default=64,
-        help="Max outward bp shift for stair boundary refinement.",
-    )
-    parser.add_argument(
-        "--postprocess_stair_inner_shift",
-        type=int,
-        default=16,
-        help="Max inward bp shift for stair boundary refinement.",
-    )
-    parser.add_argument(
-        "--postprocess_stair_min_drop",
-        type=float,
-        default=0.1,
-        help="Minimal relative drop ratio to move boundary.",
-    )
-    parser.add_argument(
-        "--postprocess_min_length",
-        type=int,
-        default=4,
-        help=(
-            "Run-length cleanup threshold after stair-refine: fill short internal 0-runs, "
-            "then remove short 1-runs."
-        ),
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit number of sequences for debug",
-    )
+
+    parser.add_argument("--input", type=str, nargs="+", default=d["input"], help="Input FASTA/Parquet files or directories")
+    parser.add_argument("--model_name", type=str, default=d["model_name"], help="HuggingFace model path or name")
+    parser.add_argument("--batch_size", type=int, default=d["batch_size"], help="Batch size for inference")
+    parser.add_argument("--gpu_count", type=int, default=d["gpu_count"], help="Number of GPUs to use (-1 for all)")
+    parser.add_argument("--output_path", type=str, default=d["output_path"], help="Output directory")
+    parser.add_argument("--context_length", type=int, default=d["context_length"], help="Context length in tokens")
+    parser.add_argument("--overlap_length", type=int, default=d["overlap_length"], help="Overlap length in tokens")
+
+    parser.add_argument("--bf16", action="store_true", default=d["bf16"], help="Use bfloat16 for inference")
+    parser.add_argument("--no_postprocess", action="store_true", default=d["no_postprocess"], help="Disable postprocess")
+
+    parser.add_argument("--postprocess_stair_max_shift", type=int, default=d["postprocess_stair_max_shift"], help="Max outward bp shift")
+    parser.add_argument("--postprocess_stair_inner_shift", type=int, default=d["postprocess_stair_inner_shift"], help="Max inward bp shift")
+    parser.add_argument("--postprocess_stair_min_drop", type=float, default=d["postprocess_stair_min_drop"], help="Minimal relative drop ratio")
+    parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
+    parser.add_argument("--limit", type=int, default=d["limit"], help="Limit number of sequences (debug)")
+
     return parser.parse_args()
 
 
