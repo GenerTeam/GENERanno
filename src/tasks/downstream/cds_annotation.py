@@ -78,20 +78,20 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument("--input", type=str, nargs="+", default=d["input"], help="Input FASTA/Parquet files or directories")
     parser.add_argument("--model_name", type=str, default=d["model_name"], help="HuggingFace model path or name")
-    parser.add_argument("--batch_size", type=int, default=d["batch_size"], help="Batch size for inference")
-    parser.add_argument("--gpu_count", type=int, default=d["gpu_count"], help="Number of GPUs to use (-1 for all)")
     parser.add_argument("--output_path", type=str, default=d["output_path"], help="Output directory")
     parser.add_argument("--context_length", type=int, default=d["context_length"], help="Context length in tokens")
     parser.add_argument("--overlap_length", type=int, default=d["overlap_length"], help="Overlap length in tokens")
 
-    parser.add_argument("--bf16", action="store_true", default=d["bf16"], help="Use bfloat16 for inference")
-    parser.add_argument("--no_postprocess", action="store_true", default=d["no_postprocess"], help="Disable postprocess")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--gpu_count", type=int, default=-1, help="Number of GPUs to use (-1 for all)")
+    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 for faster inference")
+    parser.add_argument("--no_postprocess", action="store_true", help="Disable postprocess")
 
     parser.add_argument("--postprocess_stair_max_shift", type=int, default=d["postprocess_stair_max_shift"], help="Max outward bp shift")
     parser.add_argument("--postprocess_stair_inner_shift", type=int, default=d["postprocess_stair_inner_shift"], help="Max inward bp shift")
     parser.add_argument("--postprocess_stair_min_drop", type=float, default=d["postprocess_stair_min_drop"], help="Minimal relative drop ratio")
     parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
-    parser.add_argument("--limit", type=int, default=d["limit"], help="Limit number of sequences (debug)")
+    parser.add_argument("--limit", type=int, help="Limit number of sequences (debug)")
 
     return parser.parse_args()
 
