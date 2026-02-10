@@ -34,9 +34,9 @@ PRESET_DEFAULTS = {
         "output_path": "./eukaryote_annotation_results",
         "context_length": 16384,
         "overlap_length": 1024,
-        "postprocess_stair_max_shift": 64,
-        "postprocess_stair_inner_shift": 16,
-        "postprocess_stair_min_drop": 0.1,
+        "postprocess_stair_outward_shift": 64,
+        "postprocess_stair_inward_shift": 16,
+        "postprocess_stair_min_drop_ratio": 0.1,
         "postprocess_min_length": 4,
     },
     "prokaryote": {
@@ -45,9 +45,9 @@ PRESET_DEFAULTS = {
         "output_path": "./prokaryote_annotation_results",
         "context_length": 8192,
         "overlap_length": 512,
-        "postprocess_stair_max_shift": 64,
-        "postprocess_stair_inner_shift": 16,
-        "postprocess_stair_min_drop": 0.1,
+        "postprocess_stair_outward_shift": 64,
+        "postprocess_stair_inward_shift": 16,
+        "postprocess_stair_min_drop_ratio": 0.1,
         "postprocess_min_length": 4,
     },
 }
@@ -60,38 +60,36 @@ def parse_arguments() -> argparse.Namespace:
 
     # ---- Pass 1: require organism to select preset ----
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument(
-        "--organism",
-        type=str,
-        choices=list(PRESET_DEFAULTS.keys()),
-        required=True,
-        help="Select which preset configuration to use.",
-    )
+    pre_parser.add_argument("--organism", type=str, choices=list(PRESET_DEFAULTS.keys()), required=True, help="Select which preset configuration to use.")
     pre_args, _ = pre_parser.parse_known_args()
     d = PRESET_DEFAULTS[pre_args.organism]
 
     # ---- Pass 2: full parser ----
-    parser = argparse.ArgumentParser(
-        description="Downstream Task: Coding DNA Sequence (CDS) Annotation.",
-        parents=[pre_parser],
-    )
+    parser = argparse.ArgumentParser(description="Downstream Task: Coding DNA Sequence (CDS) Annotation.", parents=[pre_parser])
 
+    # ===== Inputs / outputs =====
     parser.add_argument("--input", type=str, nargs="+", default=d["input"], help="Input FASTA/Parquet files or directories")
-    parser.add_argument("--model_name", type=str, default=d["model_name"], help="HuggingFace model path or name")
     parser.add_argument("--output_path", type=str, default=d["output_path"], help="Output directory")
-    parser.add_argument("--context_length", type=int, default=d["context_length"], help="Context length in tokens")
-    parser.add_argument("--overlap_length", type=int, default=d["overlap_length"], help="Overlap length in tokens")
 
+    # ===== Model / runtime =====
+    parser.add_argument("--model_name", type=str, default=d["model_name"], help="HuggingFace model path or name")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
     parser.add_argument("--gpu_count", type=int, default=-1, help="Number of GPUs to use (-1 for all)")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 for faster inference")
-    parser.add_argument("--no_postprocess", action="store_true", help="Disable postprocess")
 
-    parser.add_argument("--postprocess_stair_max_shift", type=int, default=d["postprocess_stair_max_shift"], help="Max outward bp shift")
-    parser.add_argument("--postprocess_stair_inner_shift", type=int, default=d["postprocess_stair_inner_shift"], help="Max inward bp shift")
-    parser.add_argument("--postprocess_stair_min_drop", type=float, default=d["postprocess_stair_min_drop"], help="Minimal relative drop ratio")
+    # ===== Sequence chunking =====
+    parser.add_argument("--context_length", type=int, default=d["context_length"], help="Context length in tokens")
+    parser.add_argument("--overlap_length", type=int, default=d["overlap_length"], help="Overlap length in tokens")
+
+    # ===== Postprocess =====
+    parser.add_argument("--postprocess_stair_outward_shift", type=int, default=d["postprocess_stair_outward_shift"], help="Max outward bp shift")
+    parser.add_argument("--postprocess_stair_inward_shift", type=int, default=d["postprocess_stair_inward_shift"], help="Max inward bp shift")
+    parser.add_argument("--postprocess_stair_min_drop_ratio", type=float, default=d["postprocess_stair_min_drop_ratio"], help="Minimal relative drop ratio")
     parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
-    parser.add_argument("--limit", type=int, help="Limit number of sequences (debug)")
+
+    # ===== Debug =====
+    parser.add_argument("--no_postprocess", action="store_true", help="Disable postprocess (debug)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of sequences (debug)")
 
     return parser.parse_args()
 
@@ -829,9 +827,9 @@ def process_sequences_on_gpu(
     micro_batch_size: int,
     progress_bar: tqdm = None,
     enable_postprocess: bool = True,
-    postprocess_stair_max_shift: int = 64,
-    postprocess_stair_inner_shift: int = 16,
-    postprocess_stair_min_drop: float = 0.1,
+    postprocess_stair_outward_shift: int = 64,
+    postprocess_stair_inward_shift: int = 16,
+    postprocess_stair_min_drop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
@@ -971,9 +969,9 @@ def process_sequences_on_gpu(
                 final_seq_preds_np = postprocess_argmax_stair_refine(
                     class1_confidence=class1_conf,
                     argmax_preds=argmax_preds_np,
-                    max_shift=postprocess_stair_max_shift,
-                    inner_shift=postprocess_stair_inner_shift,
-                    min_drop_ratio=postprocess_stair_min_drop,
+                    max_shift=postprocess_stair_outward_shift,
+                    inner_shift=postprocess_stair_inward_shift,
+                    min_drop_ratio=postprocess_stair_min_drop_ratio,
                 )
                 if postprocess_min_length > 1:
                     final_seq_preds_np = cleanup_short_binary_runs(
@@ -1003,9 +1001,9 @@ def worker_process(
     overlap_length: int,
     micro_batch_size: int,
     enable_postprocess: bool,
-    postprocess_stair_max_shift: int,
-    postprocess_stair_inner_shift: int,
-    postprocess_stair_min_drop: float,
+    postprocess_stair_outward_shift: int,
+    postprocess_stair_inward_shift: int,
+    postprocess_stair_min_drop_ratio: float,
     postprocess_min_length: int,
     result_queue: mp.Queue,
     progress_queue: mp.Queue,
@@ -1037,9 +1035,9 @@ def worker_process(
             micro_batch_size,
             progress_bar=None,
             enable_postprocess=enable_postprocess,
-            postprocess_stair_max_shift=postprocess_stair_max_shift,
-            postprocess_stair_inner_shift=postprocess_stair_inner_shift,
-            postprocess_stair_min_drop=postprocess_stair_min_drop,
+            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+            postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
             postprocess_min_length=postprocess_min_length,
         )
         result_queue.put((gpu_id, gpu_results))
@@ -1059,9 +1057,9 @@ def annotate_fasta(
     overlap_length: int,
     micro_batch_size: int,
     enable_postprocess: bool = True,
-    postprocess_stair_max_shift: int = 64,
-    postprocess_stair_inner_shift: int = 16,
-    postprocess_stair_min_drop: float = 0.1,
+    postprocess_stair_outward_shift: int = 64,
+    postprocess_stair_inward_shift: int = 16,
+    postprocess_stair_min_drop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
@@ -1104,9 +1102,9 @@ def annotate_fasta(
                 micro_batch_size,
                 progress_bar=pbar,
                 enable_postprocess=enable_postprocess,
-                postprocess_stair_max_shift=postprocess_stair_max_shift,
-                postprocess_stair_inner_shift=postprocess_stair_inner_shift,
-                postprocess_stair_min_drop=postprocess_stair_min_drop,
+                postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
                 postprocess_min_length=postprocess_min_length,
             )
         
@@ -1138,9 +1136,9 @@ def annotate_fasta(
                     overlap_length,
                     micro_batch_size,
                     enable_postprocess,
-                    postprocess_stair_max_shift,
-                    postprocess_stair_inner_shift,
-                    postprocess_stair_min_drop,
+                    postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift,
+                    postprocess_stair_min_drop_ratio,
                     postprocess_min_length,
                     result_queue,
                     progress_queue,
@@ -1337,17 +1335,17 @@ def main() -> None:
     print(f"🎯 Using {gpu_count} GPU(s) out of {available_gpus} available")
 
     enable_postprocess = not args.no_postprocess
-    postprocess_stair_max_shift = args.postprocess_stair_max_shift
-    postprocess_stair_inner_shift = args.postprocess_stair_inner_shift
-    postprocess_stair_min_drop = args.postprocess_stair_min_drop
+    postprocess_stair_outward_shift = args.postprocess_stair_outward_shift
+    postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
+    postprocess_stair_min_drop_ratio = args.postprocess_stair_min_drop_ratio
     postprocess_min_length = args.postprocess_min_length
 
     if enable_postprocess:
         print(
             "🎯 Postprocess enabled: "
-            f"max_shift={postprocess_stair_max_shift}, "
-            f"inner_shift={postprocess_stair_inner_shift}, "
-            f"min_drop_ratio={postprocess_stair_min_drop:.3f}, "
+            f"max_shift={postprocess_stair_outward_shift}, "
+            f"inner_shift={postprocess_stair_inward_shift}, "
+            f"min_drop_ratio={postprocess_stair_min_drop_ratio:.3f}, "
             f"min_length={postprocess_min_length}"
         )
     else:
@@ -1384,9 +1382,9 @@ def main() -> None:
             overlap_length=args.overlap_length,
             micro_batch_size=args.batch_size,
             enable_postprocess=enable_postprocess,
-            postprocess_stair_max_shift=postprocess_stair_max_shift,
-            postprocess_stair_inner_shift=postprocess_stair_inner_shift,
-            postprocess_stair_min_drop=postprocess_stair_min_drop,
+            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+            postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
             postprocess_min_length=postprocess_min_length,
         )
 
