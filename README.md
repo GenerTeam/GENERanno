@@ -8,6 +8,7 @@
 
 ## 📰 News
 
+* 🤗 **[2026-02-10]** Our expert model for eukaryotic genome annotation `GENERanno-eukaryote-1.2b-cds-annotator-preview` is now available on [HuggingFace](https://huggingface.co/GenerTeam/GENERanno-eukaryote-1.2b-cds-annotator-preview)!
 * 📑 **[2025-06-05]** Our paper is now available on [bioRxiv](https://www.biorxiv.org/content/10.1101/2025.06.04.656517v1)!
 * 🤗 **[2025-05-10]** Our expert model for metagenomic annotation `GENERanno-prokaryote-0.5b-cds-annotator` is now available on [HuggingFace](https://huggingface.co/GenerTeam/GENERanno-prokaryote-0.5b-cds-annotator)!
 * 🤗 **[2025-02-11]** Our models `GENERanno-prokaryote-0.5b-base`,
@@ -79,21 +80,47 @@ pip install -r requirements.txt
 
 #### Coding DNA Sequence (CDS) Annotation
 
-To run the coding sequence annotation task on
-our [cds annotation dataset](https://huggingface.co/datasets/GenerTeam/cds-annotation/), you can use the
-following command:
+You can run CDS annotation on the [cds-annotation dataset](https://huggingface.co/datasets/GenerTeam/cds-annotation/) using the unified CLI interface below.
 
-```shell
-# Using all available GPUs (default)
-python src/tasks/downstream/cds_annotation.py
+##### Basic usage
 
-# Using specific number of GPUs
-python src/tasks/downstream/cds_annotation.py --gpu_count ${NUM_GPUS}
+```bash
+# Eukaryotic genome annotation
+python src/tasks/downstream/cds_annotation.py --organism eukaryote
 
-# BF16 for faster inference (recommended if supported)
-python src/tasks/downstream/cds_annotation.py --bf16
+# Prokaryotic genome annotation
+python src/tasks/downstream/cds_annotation.py --organism prokaryote
 ```
-Note: BF16 provides faster inference with minimal accuracy impact on supported hardware.
+
+##### Custom input
+
+By default, each `--organism` preset uses a built-in example input.
+You can override it with your own FASTA or Parquet file:
+
+```bash
+# Parquet input
+python src/tasks/downstream/cds_annotation.py \
+  --organism eukaryote \
+  --input hf://datasets/GenerTeam/cds-annotation/examples/fly_GCF_000001215.4.parquet
+
+# FASTA input
+python src/tasks/downstream/cds_annotation.py \
+  --organism eukaryote \
+  --input hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta
+```
+
+##### Performance options
+
+```bash
+# Use all available GPUs (default)
+python src/tasks/downstream/cds_annotation.py --organism eukaryote
+
+# Use a specific number of GPUs
+python src/tasks/downstream/cds_annotation.py --organism eukaryote --gpu_count ${NUM_GPUS}
+
+# Enable BF16 for faster inference (recommended if supported)
+python src/tasks/downstream/cds_annotation.py --organism eukaryote --bf16
+```
 
 #### Sequence Understanding (Classification/Regression)
 
@@ -168,3 +195,16 @@ torchrun --nnodes=${NUM_NODES} \
 	journal = {bioRxiv}
 }
 ```
+
+## 📈 Benchmark Performance
+
+### Coding DNA Sequence (CDS) Annotation — `GENERanno-prokaryote-0.5b-cds-annotator-preview`
+![bacteria_annotation_summary](figures/bacteria_annotation_summary.png)
+The detailed annotation results are provived [here](https://huggingface.co/datasets/GenerTeam/cds-annotation).
+
+### Sequence Understanding (Classification/Regression) — `GENERanno-prokaryote-0.5b-base`
+![benchmarks](figures/prokaryotic_gener_tasks.png)
+
+### Sequence Understanding (Classification/Regression) — `GENERanno-eukaryote-0.5b-base`
+![benchmarks](figures/eukaryotic_benchmarks.png)
+
