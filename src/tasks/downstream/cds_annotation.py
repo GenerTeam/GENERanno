@@ -36,7 +36,6 @@ PRESET_DEFAULTS = {
         "overlap_length": 1024,
         "postprocess_stair_outward_shift": 64,
         "postprocess_stair_inward_shift": 16,
-        "postprocess_stair_min_drop_ratio": 0.1,
         "postprocess_min_length": 4,
     },
     "prokaryote": {
@@ -47,7 +46,6 @@ PRESET_DEFAULTS = {
         "overlap_length": 512,
         "postprocess_stair_outward_shift": 64,
         "postprocess_stair_inward_shift": 16,
-        "postprocess_stair_min_drop_ratio": 0.1,
         "postprocess_min_length": 4,
     },
 }
@@ -84,7 +82,6 @@ def parse_arguments() -> argparse.Namespace:
     # ===== Postprocess =====
     parser.add_argument("--postprocess_stair_outward_shift", type=int, default=d["postprocess_stair_outward_shift"], help="Max outward bp shift")
     parser.add_argument("--postprocess_stair_inward_shift", type=int, default=d["postprocess_stair_inward_shift"], help="Max inward bp shift")
-    parser.add_argument("--postprocess_stair_min_drop_ratio", type=float, default=d["postprocess_stair_min_drop_ratio"], help="Minimal relative drop ratio")
     parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
 
     # ===== Debug =====
@@ -254,72 +251,54 @@ def find_largest_downstep_top(
     values: np.ndarray,
     left: int,
     right: int,
-    min_drop_ratio: float = 0.0,
     direction: str = "right",
-) -> Tuple[int, float, float]:
+) -> Tuple[int, float]:
     """
     Find max adjacent down-step in [left, right].
     - direction='right': x[i]-x[i+1]
     - direction='left':  x[i]-x[i-1]
     """
+    dir_flag = str(direction).lower()
+    assert dir_flag in ("left", "right")
+
     n = values.shape[0]
     if n == 0:
-        return 0, 0.0, 0.0
+        return 0, 0.0
 
     l = max(0, left)
     r = min(n - 1, right)
     if l > r:
-        return max(0, min(n - 1, l)), 0.0, 0.0
+        return max(0, min(n - 1, l)), 0.0
 
     x = values.astype(np.float64, copy=False)
-    drop_ratio_thr = min_drop_ratio
-    dir_flag = str(direction).lower()
-    if dir_flag not in ("left", "right"):
-        raise ValueError(f"direction must be 'left' or 'right', got {direction!r}")
     if l == r:
-        return l, 0.0, 0.0
+        return l, 0.0
 
     best_top = l if dir_flag == "right" else r
     best_drop_abs = 0.0
-    best_drop_ratio = 0.0
     eps = 1e-12
 
     if dir_flag == "right":
         for top in range(l, r):
             drop_abs = float(x[top] - x[top + 1])
-            base = max(float(x[top]), 1e-6)
-            drop_ratio = drop_abs / base
-            if (
-                drop_abs > best_drop_abs + eps
-                or (abs(drop_abs - best_drop_abs) <= eps and drop_ratio > best_drop_ratio + eps)
-            ):
+            if drop_abs > best_drop_abs + eps:
                 best_top = top
                 best_drop_abs = drop_abs
-                best_drop_ratio = drop_ratio
     else:
         for top in range(l + 1, r + 1):
             drop_abs = float(x[top] - x[top - 1])
-            base = max(float(x[top]), 1e-6)
-            drop_ratio = drop_abs / base
-            if (
-                drop_abs > best_drop_abs + eps
-                or (abs(drop_abs - best_drop_abs) <= eps and drop_ratio > best_drop_ratio + eps)
-            ):
+            if drop_abs > best_drop_abs + eps:
                 best_top = top
                 best_drop_abs = drop_abs
-                best_drop_ratio = drop_ratio
 
-    if best_drop_ratio < drop_ratio_thr:
-        return (r if dir_flag == "left" else l), 0.0, best_drop_ratio
-    return best_top, best_drop_abs, best_drop_ratio
+    return best_top, best_drop_abs
 
 
 def postprocess_argmax_stair_refine(
     class1_confidence: np.ndarray,
     argmax_preds: np.ndarray,
-    max_shift: int = 100,
-    inner_shift: int = 10,
-    min_drop_ratio: float = 0.1,
+    max_shift: int = 64,
+    inner_shift: int = 16,
 ) -> np.ndarray:
     if class1_confidence.ndim != 1:
         raise ValueError("class1_confidence must be 1D")
@@ -331,95 +310,67 @@ def postprocess_argmax_stair_refine(
     n = class1_confidence.shape[0]
     shift = max_shift
     in_shift = inner_shift
-    drop_ratio_thr = min_drop_ratio
 
     pred_is_cds = argmax_preds.astype(np.int8, copy=False) != 0
     intervals = extract_intervals_from_binary(pred_is_cds.astype(np.int8, copy=False))
     if intervals.shape[0] == 0:
         return pred_is_cds.astype(np.int64)
 
-    refined: List[Tuple[int, int]] = []
+    out = np.zeros(n, dtype=np.int64)
     for s, e in intervals:
         start = int(s)
         end = int(e)
         new_start = start
         new_end = end
+        eps = 1e-12
 
         left_out_l = max(0, start - shift)
         left_out_r = start
-        cand_start_out, drop_start_out, ratio_start_out = find_largest_downstep_top(
-            class1_confidence, left_out_l, left_out_r, min_drop_ratio=0.0, direction="left"
+        cand_start_out, drop_start_out = find_largest_downstep_top(
+            class1_confidence, left_out_l, left_out_r, direction="left"
         )
         left_in_l = start
         left_in_r = min(end, start + in_shift)
-        cand_start_in, drop_start_in, ratio_start_in = find_largest_downstep_top(
-            class1_confidence, left_in_l, left_in_r, min_drop_ratio=0.0, direction="left"
+        cand_start_in, drop_start_in = find_largest_downstep_top(
+            class1_confidence, left_in_l, left_in_r, direction="left"
         )
 
         best_start = start
         best_start_drop = 0.0
-        best_start_ratio = 0.0
-        for cand_idx, drop_abs, drop_ratio in (
-            (cand_start_out, drop_start_out, ratio_start_out),
-            (cand_start_in, drop_start_in, ratio_start_in),
+        for cand_idx, drop_abs in (
+            (cand_start_out, drop_start_out),
+            (cand_start_in, drop_start_in),
         ):
-            if drop_abs <= 0.0 or drop_ratio < drop_ratio_thr:
-                continue
-            if (
-                drop_abs > best_start_drop
-                or (np.isclose(drop_abs, best_start_drop) and drop_ratio > best_start_ratio)
-            ):
+            if drop_abs > best_start_drop + eps:
                 best_start = int(cand_idx)
                 best_start_drop = float(drop_abs)
-                best_start_ratio = float(drop_ratio)
-        if best_start_drop > 0.0:
-            new_start = best_start
+        new_start = best_start
 
         right_out_l = end
         right_out_r = min(n - 1, end + shift)
-        cand_end_out, drop_end_out, ratio_end_out = find_largest_downstep_top(
-            class1_confidence, right_out_l, right_out_r, min_drop_ratio=0.0, direction="right"
+        cand_end_out, drop_end_out = find_largest_downstep_top(
+            class1_confidence, right_out_l, right_out_r, direction="right"
         )
         right_in_l = max(start, end - in_shift)
         right_in_r = end
-        cand_end_in, drop_end_in, ratio_end_in = find_largest_downstep_top(
-            class1_confidence, right_in_l, right_in_r, min_drop_ratio=0.0, direction="right"
+        cand_end_in, drop_end_in = find_largest_downstep_top(
+            class1_confidence, right_in_l, right_in_r, direction="right"
         )
 
         best_end = end
         best_end_drop = 0.0
-        best_end_ratio = 0.0
-        for cand_idx, drop_abs, drop_ratio in (
-            (cand_end_out, drop_end_out, ratio_end_out),
-            (cand_end_in, drop_end_in, ratio_end_in),
+        for cand_idx, drop_abs in (
+            (cand_end_out, drop_end_out),
+            (cand_end_in, drop_end_in),
         ):
-            if drop_abs <= 0.0 or drop_ratio < drop_ratio_thr:
-                continue
-            if (
-                drop_abs > best_end_drop
-                or (np.isclose(drop_abs, best_end_drop) and drop_ratio > best_end_ratio)
-            ):
+            if drop_abs > best_end_drop + eps:
                 best_end = int(cand_idx)
                 best_end_drop = float(drop_abs)
-                best_end_ratio = float(drop_ratio)
-        if best_end_drop > 0.0:
-            new_end = best_end
+        new_end = best_end
 
         if new_end < new_start:
-            new_start, new_end = start, end
-        refined.append((new_start, new_end))
-
-    refined.sort(key=lambda x: (x[0], x[1]))
-    merged: List[Tuple[int, int]] = []
-    for s, e in refined:
-        if not merged or s > merged[-1][1] + 1:
-            merged.append((s, e))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-
-    out = np.zeros(n, dtype=np.int64)
-    for s, e in merged:
-        out[s : e + 1] = 1
+            continue
+        out[new_start : new_end + 1] = 1
     return out
 
 
@@ -829,7 +780,6 @@ def process_sequences_on_gpu(
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
-    postprocess_stair_min_drop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
@@ -971,7 +921,6 @@ def process_sequences_on_gpu(
                     argmax_preds=argmax_preds_np,
                     max_shift=postprocess_stair_outward_shift,
                     inner_shift=postprocess_stair_inward_shift,
-                    min_drop_ratio=postprocess_stair_min_drop_ratio,
                 )
                 if postprocess_min_length > 1:
                     final_seq_preds_np = cleanup_short_binary_runs(
@@ -1003,7 +952,6 @@ def worker_process(
     enable_postprocess: bool,
     postprocess_stair_outward_shift: int,
     postprocess_stair_inward_shift: int,
-    postprocess_stair_min_drop_ratio: float,
     postprocess_min_length: int,
     result_queue: mp.Queue,
     progress_queue: mp.Queue,
@@ -1037,7 +985,6 @@ def worker_process(
             enable_postprocess=enable_postprocess,
             postprocess_stair_outward_shift=postprocess_stair_outward_shift,
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-            postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
             postprocess_min_length=postprocess_min_length,
         )
         result_queue.put((gpu_id, gpu_results))
@@ -1059,7 +1006,6 @@ def annotate_fasta(
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
-    postprocess_stair_min_drop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
@@ -1104,7 +1050,6 @@ def annotate_fasta(
                 enable_postprocess=enable_postprocess,
                 postprocess_stair_outward_shift=postprocess_stair_outward_shift,
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-                postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
                 postprocess_min_length=postprocess_min_length,
             )
         
@@ -1138,7 +1083,6 @@ def annotate_fasta(
                     enable_postprocess,
                     postprocess_stair_outward_shift,
                     postprocess_stair_inward_shift,
-                    postprocess_stair_min_drop_ratio,
                     postprocess_min_length,
                     result_queue,
                     progress_queue,
@@ -1337,7 +1281,6 @@ def main() -> None:
     enable_postprocess = not args.no_postprocess
     postprocess_stair_outward_shift = args.postprocess_stair_outward_shift
     postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
-    postprocess_stair_min_drop_ratio = args.postprocess_stair_min_drop_ratio
     postprocess_min_length = args.postprocess_min_length
 
     if enable_postprocess:
@@ -1345,7 +1288,6 @@ def main() -> None:
             "🎯 Postprocess enabled: "
             f"max_shift={postprocess_stair_outward_shift}, "
             f"inner_shift={postprocess_stair_inward_shift}, "
-            f"min_drop_ratio={postprocess_stair_min_drop_ratio:.3f}, "
             f"min_length={postprocess_min_length}"
         )
     else:
@@ -1384,7 +1326,6 @@ def main() -> None:
             enable_postprocess=enable_postprocess,
             postprocess_stair_outward_shift=postprocess_stair_outward_shift,
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-            postprocess_stair_min_drop_ratio=postprocess_stair_min_drop_ratio,
             postprocess_min_length=postprocess_min_length,
         )
 
