@@ -109,6 +109,7 @@ python src/tasks/downstream/cds_annotation.py --organism eukaryote --gpu_count $
 # Enable BF16 for faster inference (recommended if supported)
 python src/tasks/downstream/cds_annotation.py --organism eukaryote --bf16
 ```
+Note: BF16 improves inference speed on supported hardware (e.g. A100) with minimal impact on accuracy.
 
 #### Sequence Understanding (Classification/Regression)
 
