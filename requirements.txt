@@ -4,3 +4,4 @@ datasets<3.0.0
 scikit-learn
 deepspeed
 wandb
+numba

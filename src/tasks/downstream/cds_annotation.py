@@ -3,7 +3,9 @@ import os
 
 import argparse
 import datetime
+import queue
 import time
+from collections import deque
 from typing import Dict, IO, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -11,6 +13,7 @@ import torch
 import numpy as np
 import torch.multiprocessing as mp
 from tqdm import tqdm
+from numba import njit
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
@@ -73,6 +76,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--model_name", type=str, default=d["model_name"], help="HuggingFace model path or name")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
     parser.add_argument("--gpu_count", type=int, default=-1, help="Number of GPUs to use (-1 for all)")
+    parser.add_argument("--cpu_count", type=int, default=max(1, int((os.cpu_count() or 1) * 0.8)), help="Number of CPUs to use")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 for faster inference")
 
     # ===== Sequence chunking =====
@@ -192,11 +196,17 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
     }
 
 
+@njit(cache=True)
 def extract_intervals_from_binary(labels: np.ndarray) -> np.ndarray:
     if labels.ndim != 1 or labels.shape[0] == 0:
         return np.empty((0, 2), dtype=np.int32)
 
-    diff = np.diff(np.concatenate(([0], labels.astype(np.int8), [0])))
+    labels_i8 = labels.astype(np.int8)
+    padded = np.empty(labels_i8.shape[0] + 2, dtype=np.int8)
+    padded[0] = 0
+    padded[-1] = 0
+    padded[1:-1] = labels_i8
+    diff = np.diff(padded)
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0] - 1
     if starts.shape[0] == 0:
@@ -204,6 +214,7 @@ def extract_intervals_from_binary(labels: np.ndarray) -> np.ndarray:
     return np.stack((starts.astype(np.int32), ends.astype(np.int32)), axis=1)
 
 
+@njit(cache=True)
 def cleanup_short_binary_runs(values: np.ndarray, min_length: int) -> np.ndarray:
     """
     1) Fill internal 0-runs shorter than min_length (edge 0-runs kept).
@@ -216,7 +227,7 @@ def cleanup_short_binary_runs(values: np.ndarray, min_length: int) -> np.ndarray
         return np.empty((0,), dtype=np.int64)
 
     m = min_length
-    out = (values.astype(np.int8, copy=False) != 0).astype(np.int8, copy=True)
+    out = (values.astype(np.int8) != 0).astype(np.int8)
     if m <= 1:
         return out.astype(np.int64)
 
@@ -247,20 +258,18 @@ def cleanup_short_binary_runs(values: np.ndarray, min_length: int) -> np.ndarray
     return out.astype(np.int64)
 
 
+@njit(cache=True)
 def find_largest_downstep_top(
     values: np.ndarray,
     left: int,
     right: int,
-    direction: str = "right",
+    dir_is_right: bool = True,
 ) -> Tuple[int, float]:
     """
     Find max adjacent down-step in [left, right].
-    - direction='right': x[i]-x[i+1]
-    - direction='left':  x[i]-x[i-1]
+    - dir_is_right=True (right): x[i]-x[i+1]
+    - dir_is_right=False (left): x[i]-x[i-1]
     """
-    dir_flag = str(direction).lower()
-    assert dir_flag in ("left", "right")
-
     n = values.shape[0]
     if n == 0:
         return 0, 0.0
@@ -270,30 +279,29 @@ def find_largest_downstep_top(
     if l > r:
         return max(0, min(n - 1, l)), 0.0
 
-    x = values.astype(np.float64, copy=False)
     if l == r:
         return l, 0.0
 
-    best_top = l if dir_flag == "right" else r
+    best_top = l if dir_is_right else r
     best_drop_abs = 0.0
-    eps = 1e-12
 
-    if dir_flag == "right":
+    if dir_is_right:
         for top in range(l, r):
-            drop_abs = float(x[top] - x[top + 1])
-            if drop_abs > best_drop_abs + eps:
+            drop_abs = float(values[top] - values[top + 1])
+            if drop_abs > best_drop_abs:
                 best_top = top
                 best_drop_abs = drop_abs
     else:
         for top in range(l + 1, r + 1):
-            drop_abs = float(x[top] - x[top - 1])
-            if drop_abs > best_drop_abs + eps:
+            drop_abs = float(values[top] - values[top - 1])
+            if drop_abs > best_drop_abs:
                 best_top = top
                 best_drop_abs = drop_abs
 
     return best_top, best_drop_abs
 
 
+@njit(cache=True)
 def postprocess_argmax_stair_refine(
     class1_confidence: np.ndarray,
     argmax_preds: np.ndarray,
@@ -311,8 +319,8 @@ def postprocess_argmax_stair_refine(
     shift = max_shift
     in_shift = inner_shift
 
-    pred_is_cds = argmax_preds.astype(np.int8, copy=False) != 0
-    intervals = extract_intervals_from_binary(pred_is_cds.astype(np.int8, copy=False))
+    pred_is_cds = argmax_preds.astype(np.int8) != 0
+    intervals = extract_intervals_from_binary(pred_is_cds.astype(np.int8))
     if intervals.shape[0] == 0:
         return pred_is_cds.astype(np.int64)
 
@@ -322,17 +330,16 @@ def postprocess_argmax_stair_refine(
         end = int(e)
         new_start = start
         new_end = end
-        eps = 1e-12
 
         left_out_l = max(0, start - shift)
         left_out_r = start
         cand_start_out, drop_start_out = find_largest_downstep_top(
-            class1_confidence, left_out_l, left_out_r, direction="left"
+            class1_confidence, left_out_l, left_out_r, False
         )
         left_in_l = start
         left_in_r = min(end, start + in_shift)
         cand_start_in, drop_start_in = find_largest_downstep_top(
-            class1_confidence, left_in_l, left_in_r, direction="left"
+            class1_confidence, left_in_l, left_in_r, False
         )
 
         best_start = start
@@ -341,7 +348,7 @@ def postprocess_argmax_stair_refine(
             (cand_start_out, drop_start_out),
             (cand_start_in, drop_start_in),
         ):
-            if drop_abs > best_start_drop + eps:
+            if drop_abs > best_start_drop:
                 best_start = int(cand_idx)
                 best_start_drop = float(drop_abs)
         new_start = best_start
@@ -349,12 +356,12 @@ def postprocess_argmax_stair_refine(
         right_out_l = end
         right_out_r = min(n - 1, end + shift)
         cand_end_out, drop_end_out = find_largest_downstep_top(
-            class1_confidence, right_out_l, right_out_r, direction="right"
+            class1_confidence, right_out_l, right_out_r, True
         )
         right_in_l = max(start, end - in_shift)
         right_in_r = end
         cand_end_in, drop_end_in = find_largest_downstep_top(
-            class1_confidence, right_in_l, right_in_r, direction="right"
+            class1_confidence, right_in_l, right_in_r, True
         )
 
         best_end = end
@@ -363,7 +370,7 @@ def postprocess_argmax_stair_refine(
             (cand_end_out, drop_end_out),
             (cand_end_in, drop_end_in),
         ):
-            if drop_abs > best_end_drop + eps:
+            if drop_abs > best_end_drop:
                 best_end = int(cand_idx)
                 best_end_drop = float(drop_abs)
         new_end = best_end
@@ -372,6 +379,55 @@ def postprocess_argmax_stair_refine(
             continue
         out[new_start : new_end + 1] = 1
     return out
+
+
+def postprocess_sequence_predictions(
+    seq_idx: int,
+    argmax_preds_per_head: List[np.ndarray],
+    class1_conf_per_head: List[Optional[np.ndarray]],
+    postprocess_stair_outward_shift: int,
+    postprocess_stair_inward_shift: int,
+    postprocess_min_length: int,
+) -> Tuple[int, List[np.ndarray]]:
+    refined_preds_per_head: List[np.ndarray] = []
+    for argmax_preds_np, class1_conf in zip(argmax_preds_per_head, class1_conf_per_head):
+        if class1_conf is None:
+            final_seq_preds_np = argmax_preds_np
+        else:
+            final_seq_preds_np = postprocess_argmax_stair_refine(
+                class1_confidence=class1_conf,
+                argmax_preds=argmax_preds_np,
+                max_shift=postprocess_stair_outward_shift,
+                inner_shift=postprocess_stair_inward_shift,
+            )
+            if postprocess_min_length > 1:
+                final_seq_preds_np = cleanup_short_binary_runs(
+                    final_seq_preds_np,
+                    min_length=postprocess_min_length,
+                )
+        refined_preds_per_head.append(final_seq_preds_np)
+    return seq_idx, refined_preds_per_head
+
+
+def postprocess_sequence_task(
+    seq_idx: int,
+    argmax_preds_per_head: List[np.ndarray],
+    class1_conf_per_head: List[Optional[np.ndarray]],
+    postprocess_stair_outward_shift: int,
+    postprocess_stair_inward_shift: int,
+    postprocess_min_length: int,
+    result_queue: mp.Queue,
+) -> None:
+    result_queue.put(
+        postprocess_sequence_predictions(
+            seq_idx=seq_idx,
+            argmax_preds_per_head=argmax_preds_per_head,
+            class1_conf_per_head=class1_conf_per_head,
+            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+            postprocess_min_length=postprocess_min_length,
+        )
+    )
 
 
 def setup_model_for_gpu(
@@ -779,7 +835,11 @@ def process_sequences_on_gpu(
     max_length: int,
     overlap_length: int,
     micro_batch_size: int,
-    progress_bar: tqdm = None,
+    infer_progress_bar: tqdm = None,
+    postprocess_progress_bar: tqdm = None,
+    infer_progress_queue: Optional[mp.Queue] = None,
+    postprocess_progress_queue: Optional[mp.Queue] = None,
+    postprocess_workers: int = 1,
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
@@ -795,7 +855,7 @@ def process_sequences_on_gpu(
         device: Computation device (CPU or GPU)
         max_length: Maximum sequence length for chunking
         micro_batch_size: Batch size for model inference
-        progress_bar: Optional progress bar to update
+        infer_progress_bar: Optional inference progress bar to update
 
     Returns:
         A list of lists of (header, annotation) tuples for the sequences
@@ -807,140 +867,213 @@ def process_sequences_on_gpu(
 
     max_char_length = max_length * tokenizer_k
     overlap_char_length = overlap_length * tokenizer_k
+    num_sequences = len(sequences)
+    annotations_per_head = [[""] * num_sequences for _ in range(num_heads)]
+    postprocess_limit = max(0, int(postprocess_workers))
+    postprocess_result_queue: Optional[mp.Queue] = None
+    active_post_processes: Dict[int, mp.Process] = {}
+    waiting_post_tasks = deque()
+    if enable_postprocess and postprocess_limit > 0:
+        postprocess_result_queue = mp.Queue()
 
-    # Step 1: Prepare all sequences for this GPU
-    all_chunks, all_masks, chr_lens = [], [], []
-    sequence_headers = []
-    chunk_pos = []
+    def update_infer_progress() -> None:
+        if infer_progress_bar is not None:
+            infer_progress_bar.update(1)
+        elif infer_progress_queue is not None:
+            infer_progress_queue.put(1)
 
-    def add_chunk(chunk_seq):
-        pad_len = max_length - len(chunk_seq)
-        all_chunks.append(chunk_seq + [pad_id] * pad_len)
-        all_masks.append([1] * len(chunk_seq) + [0] * pad_len)
-    
-    for header, seq in sequences:
-        sequence_headers.append(header)
-        chunk_pos.append([])
-        orig_chr_len = len(seq)
-        chr_len = 0
-        if len(seq) < max_char_length:
-            chrs = seq[:len(seq) // tokenizer_k * tokenizer_k]
-            chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
-            chunk_pos[-1].append((chr_len, 0, len(chrs))) # (orig start pos, new start pos, char length)
-            chr_len += len(chrs)
-            add_chunk(chunk_seq)
-            if len(seq) % tokenizer_k:
-                chrs = seq[len(seq) % tokenizer_k:]
-                chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
-                chunk_pos[-1].append((chr_len, len(seq) % tokenizer_k, len(chrs))) # (orig start pos, new start pos, char length)
-                chr_len += len(chrs)
-                add_chunk(chunk_seq)
-        else:
-            while True:
-                chrs = seq[:max_char_length]
-                chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
-                chunk_pos[-1].append((chr_len, orig_chr_len - len(seq), len(chrs))) # (orig start pos, new start pos, char length)
-                assert(len(chrs) == max_char_length)
-                chr_len += len(chrs)
-                add_chunk(chunk_seq)
-                if len(chrs) == len(seq):
-                    break
-                if len(seq) - max_char_length + overlap_char_length < max_char_length:
-                    seq = seq[-max_char_length:]
-                else:
-                    seq = seq[max_char_length - overlap_char_length:]
-        chr_lens.append(chr_len)
+    def update_post_progress() -> None:
+        if postprocess_progress_bar is not None:
+            postprocess_progress_bar.update(1)
+        elif postprocess_progress_queue is not None:
+            postprocess_progress_queue.put(1)
 
-    # Step 2: Run inference for sequences on this GPU
-    probs_per_head_flat = [[] for _ in range(num_heads)]
-
-    # Calculate how many sequences are processed in each batch
-    # This is approximate since batches contain chunks, not whole sequences
-    sequences_processed = 0
-    total_chunks = len(all_chunks)
-    
-    for start in range(0, total_chunks, micro_batch_size):
-        end = min(start + micro_batch_size, total_chunks)
-        inp = torch.tensor(all_chunks[start:end], dtype=torch.long).to(device)
-        att = torch.tensor(all_masks[start:end], dtype=torch.long).to(device)
-
-        logits = model(input_ids=inp, attention_mask=att).logits
-        probs = logits.softmax(dim=-1).cpu()
-
-        for i in range(probs.shape[0]):
-            mask = att[i].cpu()
-            valid_len = int(mask.sum()) * tokenizer_k
-
-            # The model concatenates head predictions, so we split them
-            total_pred_len = valid_len * num_heads
-            chunk_probs_all_heads = probs[i, :total_pred_len].tolist()
-
-            for h in range(num_heads):
-                start_idx = h * valid_len
-                end_idx = (h + 1) * valid_len
-                probs_per_head_flat[h].extend(chunk_probs_all_heads[start_idx:end_idx])
-
-        # Update progress bar if provided
-        if progress_bar is not None:
-            # Estimate progress based on chunks processed
-            # Each batch processes multiple chunks, but we want sequence-level progress
-            # We update more frequently for better visual feedback
-            chunks_processed = min(end, total_chunks)
-            progress_fraction = chunks_processed / total_chunks
-            target_sequences = int(progress_fraction * len(sequences))
-            if target_sequences > sequences_processed:
-                progress_bar.update(target_sequences - sequences_processed)
-                sequences_processed = target_sequences
-    
-    gpu_annotated_records = []
-    for h in range(num_heads):
-        head_annotations = []
-        cursor = 0
-        for seq_idx, (header, (_, seq), chr_len) in enumerate(zip(sequence_headers, sequences, chr_lens)):
-            seq_probs = probs_per_head_flat[h][cursor : cursor + chr_len]
-            cursor += chr_len
-
-            final_seq_probs = torch.zeros(len(seq), len(seq_probs[0]))
-            overlap_cnt = torch.zeros(len(seq), dtype=torch.long)
-            for orig_start_pos, new_start_pos, char_length in chunk_pos[seq_idx]:
-                final_seq_probs[new_start_pos:new_start_pos + char_length] += torch.as_tensor(seq_probs[orig_start_pos:orig_start_pos + char_length])
-                overlap_cnt[new_start_pos:new_start_pos + char_length] += 1
-            
-            final_seq_probs /= overlap_cnt.unsqueeze(-1)
-            argmax_preds_np = (
-                final_seq_probs.argmax(dim=-1).cpu().numpy().astype(np.int64, copy=False)
-            )
-            if enable_postprocess and final_seq_probs.ndim == 2 and final_seq_probs.shape[1] > 1:
-                class1_conf = final_seq_probs[:, 1].cpu().numpy()
-                final_seq_preds_np = postprocess_argmax_stair_refine(
-                    class1_confidence=class1_conf,
-                    argmax_preds=argmax_preds_np,
-                    max_shift=postprocess_stair_outward_shift,
-                    inner_shift=postprocess_stair_inward_shift,
-                )
-                if postprocess_min_length > 1:
-                    final_seq_preds_np = cleanup_short_binary_runs(
-                        final_seq_preds_np,
-                        min_length=postprocess_min_length,
-                    )
-                final_seq_preds = final_seq_preds_np.tolist()
-            else:
-                final_seq_preds = argmax_preds_np.tolist()
-            
-            labels = [id2label[i] for i in final_seq_preds]
+    def assign_sequence_annotations(seq_idx: int, preds_per_head: List[np.ndarray]) -> None:
+        header, seq = sequences[seq_idx]
+        for h in range(num_heads):
+            labels = [id2label[i] for i in preds_per_head[h].tolist()]
             annot = "".join(LABEL2CHAR[l] for l in labels)
-
             assert len(annot) == len(seq)
-            head_annotations.append((header, annot))
-        gpu_annotated_records.append(head_annotations)
+            annotations_per_head[h][seq_idx] = annot
 
-    # Step 3: Reconstruct annotations for sequences on this GPU
-    if progress_bar is not None:
-        # Ensure progress bar reaches 100%
-        remaining = len(sequences) - sequences_processed
-        if remaining > 0:
-            progress_bar.update(remaining)
+    def collect_postprocess_result(block: bool = False) -> bool:
+        if postprocess_result_queue is None:
+            return False
+        if not active_post_processes:
+            return False
+        if block:
+            seq_idx, final_preds_per_head = postprocess_result_queue.get()
+        else:
+            try:
+                seq_idx, final_preds_per_head = postprocess_result_queue.get_nowait()
+            except queue.Empty:
+                return False
+        assign_sequence_annotations(seq_idx, final_preds_per_head)
+        proc = active_post_processes.pop(seq_idx, None)
+        if proc is not None:
+            proc.join()
+        update_post_progress()
+        return True
 
+    def try_start_waiting_postprocess_tasks() -> None:
+        if postprocess_result_queue is None:
+            return
+        while waiting_post_tasks and len(active_post_processes) < postprocess_limit:
+            (
+                seq_idx,
+                argmax_preds_per_head,
+                class1_conf_per_head,
+            ) = waiting_post_tasks.popleft()
+            proc = mp.Process(
+                target=postprocess_sequence_task,
+                args=(
+                    seq_idx,
+                    argmax_preds_per_head,
+                    class1_conf_per_head,
+                    postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift,
+                    postprocess_min_length,
+                    postprocess_result_queue,
+                ),
+            )
+            proc.start()
+            active_post_processes[seq_idx] = proc
+
+    def pump_postprocess_nonblocking() -> None:
+        if postprocess_result_queue is None:
+            return
+        while True:
+            progressed = False
+            while collect_postprocess_result(block=False):
+                progressed = True
+            active_before = len(active_post_processes)
+            try_start_waiting_postprocess_tasks()
+            if len(active_post_processes) != active_before:
+                progressed = True
+            if not progressed:
+                break
+
+    try:
+        for seq_idx, (_, seq) in enumerate(sequences):
+            seq_chunks: List[List[int]] = []
+            seq_masks: List[List[int]] = []
+            seq_chunk_pos: List[Tuple[int, int, int]] = []
+            chr_len = 0
+
+            def add_chunk(chunk_seq: List[int]) -> None:
+                pad_len = max_length - len(chunk_seq)
+                seq_chunks.append(chunk_seq + [pad_id] * pad_len)
+                seq_masks.append([1] * len(chunk_seq) + [0] * pad_len)
+
+            seq_work = seq
+            if len(seq_work) < max_char_length:
+                chrs = seq_work[:len(seq_work) // tokenizer_k * tokenizer_k]
+                chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
+                seq_chunk_pos.append((chr_len, 0, len(chrs)))
+                chr_len += len(chrs)
+                add_chunk(chunk_seq)
+                if len(seq_work) % tokenizer_k != 0:
+                    chrs = seq_work[len(seq_work) % tokenizer_k:]
+                    chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
+                    seq_chunk_pos.append((chr_len, len(seq_work) % tokenizer_k, len(chrs)))
+                    chr_len += len(chrs)
+                    add_chunk(chunk_seq)
+            else:
+                while True:
+                    chrs = seq_work[:max_char_length]
+                    chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
+                    seq_chunk_pos.append((chr_len, len(seq) - len(seq_work), len(chrs)))
+                    assert len(chrs) == max_char_length
+                    chr_len += len(chrs)
+                    add_chunk(chunk_seq)
+                    if len(chrs) == len(seq_work):
+                        break
+                    if len(seq_work) - max_char_length + overlap_char_length < max_char_length:
+                        seq_work = seq_work[-max_char_length:]
+                    else:
+                        seq_work = seq_work[max_char_length - overlap_char_length:]
+
+            probs_per_head_flat = [[] for _ in range(num_heads)]
+            total_chunks = len(seq_chunks)
+            for start in range(0, total_chunks, micro_batch_size):
+                end = min(start + micro_batch_size, total_chunks)
+                inp = torch.tensor(seq_chunks[start:end], dtype=torch.long).to(device)
+                att = torch.tensor(seq_masks[start:end], dtype=torch.long).to(device)
+                logits = model(input_ids=inp, attention_mask=att).logits
+                probs = logits.softmax(dim=-1).cpu()
+
+                for i in range(probs.shape[0]):
+                    mask = att[i].cpu()
+                    valid_len = int(mask.sum()) * tokenizer_k
+                    total_pred_len = valid_len * num_heads
+                    chunk_probs_all_heads = probs[i, :total_pred_len].tolist()
+                    for h in range(num_heads):
+                        start_idx = h * valid_len
+                        end_idx = (h + 1) * valid_len
+                        probs_per_head_flat[h].extend(chunk_probs_all_heads[start_idx:end_idx])
+                if enable_postprocess and postprocess_result_queue is not None:
+                    pump_postprocess_nonblocking()
+
+            argmax_preds_per_head: List[np.ndarray] = []
+            class1_conf_per_head: List[Optional[np.ndarray]] = []
+            seq_len = len(seq)
+            for h in range(num_heads):
+                seq_probs = probs_per_head_flat[h]
+                final_seq_probs = torch.zeros(seq_len, len(seq_probs[0]))
+                overlap_cnt = torch.zeros(seq_len, dtype=torch.long)
+                for orig_start_pos, new_start_pos, char_length in seq_chunk_pos:
+                    final_seq_probs[new_start_pos:new_start_pos + char_length] += torch.as_tensor(
+                        seq_probs[orig_start_pos:orig_start_pos + char_length]
+                    )
+                    overlap_cnt[new_start_pos:new_start_pos + char_length] += 1
+                final_seq_probs /= overlap_cnt.unsqueeze(-1)
+
+                argmax_preds_np = final_seq_probs.argmax(dim=-1).cpu().numpy().astype(np.int64, copy=False)
+                argmax_preds_per_head.append(argmax_preds_np)
+                if enable_postprocess and final_seq_probs.ndim == 2 and final_seq_probs.shape[1] > 1:
+                    class1_conf_per_head.append(final_seq_probs[:, 1].cpu().numpy())
+                else:
+                    class1_conf_per_head.append(None)
+
+            update_infer_progress()
+            if enable_postprocess and postprocess_result_queue is not None:
+                waiting_post_tasks.append(
+                    (seq_idx, argmax_preds_per_head, class1_conf_per_head)
+                )
+                pump_postprocess_nonblocking()
+            elif enable_postprocess:
+                final_preds_per_head = postprocess_sequence_predictions(
+                    argmax_preds_per_head=argmax_preds_per_head,
+                    class1_conf_per_head=class1_conf_per_head,
+                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                    postprocess_min_length=postprocess_min_length,
+                )
+                assign_sequence_annotations(seq_idx, final_preds_per_head)
+                update_post_progress()
+            else:
+                assign_sequence_annotations(seq_idx, argmax_preds_per_head)
+
+        if enable_postprocess and postprocess_result_queue is not None:
+            while waiting_post_tasks or active_post_processes:
+                try_start_waiting_postprocess_tasks()
+                if not collect_postprocess_result(block=False):
+                    collect_postprocess_result(block=True)
+    finally:
+        for seq_idx, proc in list(active_post_processes.items()):
+            if proc.is_alive():
+                proc.terminate()
+            proc.join()
+            active_post_processes.pop(seq_idx, None)
+        waiting_post_tasks.clear()
+        if postprocess_result_queue is not None:
+            postprocess_result_queue.close()
+            postprocess_result_queue.join_thread()
+
+    gpu_annotated_records: List[List[Tuple[str, str]]] = [[] for _ in range(num_heads)]
+    for h in range(num_heads):
+        for seq_idx, (header, _) in enumerate(sequences):
+            gpu_annotated_records[h].append((header, annotations_per_head[h][seq_idx]))
     return gpu_annotated_records
 
 
@@ -956,8 +1089,10 @@ def worker_process(
     postprocess_stair_outward_shift: int,
     postprocess_stair_inward_shift: int,
     postprocess_min_length: int,
+    postprocess_workers: int,
     result_queue: mp.Queue,
-    progress_queue: mp.Queue,
+    infer_progress_queue: mp.Queue,
+    postprocess_progress_queue: Optional[mp.Queue],
 ):
     """
     Worker process that runs on a specific GPU.
@@ -969,7 +1104,8 @@ def worker_process(
         max_length: Maximum sequence length
         micro_batch_size: Batch size for inference
         result_queue: Queue to put results in
-        progress_queue: Queue to report progress
+        infer_progress_queue: Queue to report completed inference sequences
+        postprocess_progress_queue: Queue to report completed postprocessed sequences
     """
     try:
         # Setup model for this GPU
@@ -984,14 +1120,17 @@ def worker_process(
             max_length,
             overlap_length,
             micro_batch_size,
-            progress_bar=None,
+            infer_progress_bar=None,
+            postprocess_progress_bar=None,
+            infer_progress_queue=infer_progress_queue,
+            postprocess_progress_queue=postprocess_progress_queue,
+            postprocess_workers=postprocess_workers,
             enable_postprocess=enable_postprocess,
             postprocess_stair_outward_shift=postprocess_stair_outward_shift,
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
             postprocess_min_length=postprocess_min_length,
         )
         result_queue.put((gpu_id, gpu_results))
-        progress_queue.put(len(sequences))  # Report number of processed sequences
             
     except Exception as e:
         print(f"❌ Error in GPU {gpu_id} worker: {e}")
@@ -1010,6 +1149,7 @@ def annotate_fasta(
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
     postprocess_min_length: int = 4,
+    cpu_count: int = max(1, int((os.cpu_count() or 1) * 0.8)),
 ) -> List[List[Tuple[str, str]]]:
     """
     Annotate sequences using single or multiple GPUs with independent model loading.
@@ -1025,8 +1165,12 @@ def annotate_fasta(
     Returns:
         A list of lists of (header, annotation) tuples
     """
-    # Single GPU case - process directly with sequence-level progress bar
+    # Single GPU case - process directly with sequence-level progress bars
+    cpu_budget = int(cpu_count)
     if gpu_count <= 1:
+        gpu_processes = 1
+        single_postprocess_workers = max(1, cpu_budget - gpu_processes) if enable_postprocess else 0
+
         if torch.cuda.is_available() and gpu_count == 1:
             print("💻 Using single GPU processing")
             gpu_id = 0
@@ -1038,23 +1182,68 @@ def annotate_fasta(
         
         print(f"🧬 Processing {len(records)} sequences on {device}")
         
-        # For single GPU, we use a sequence-level progress bar
-        with tqdm(total=len(records), desc="Processing sequences", unit="seq") as pbar:
-            # Pass the progress bar to the processing function
-            results = process_sequences_on_gpu(
-                records,
-                model,
-                tokenizer,
-                device,
-                max_length,
-                overlap_length,
-                micro_batch_size,
-                progress_bar=pbar,
-                enable_postprocess=enable_postprocess,
-                postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-                postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-                postprocess_min_length=postprocess_min_length,
+        if enable_postprocess:
+            infer_pbar = tqdm(
+                total=len(records),
+                desc="Inference",
+                unit="seq",
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
             )
+            post_pbar = tqdm(
+                total=len(records),
+                desc="Postprocessing",
+                unit="seq",
+                position=1,
+                leave=True,
+                dynamic_ncols=True,
+            )
+            try:
+                results = process_sequences_on_gpu(
+                    records,
+                    model,
+                    tokenizer,
+                    device,
+                    max_length,
+                    overlap_length,
+                    micro_batch_size,
+                    infer_progress_bar=infer_pbar,
+                    postprocess_progress_bar=post_pbar,
+                    postprocess_workers=single_postprocess_workers,
+                    enable_postprocess=enable_postprocess,
+                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                    postprocess_min_length=postprocess_min_length,
+                )
+            finally:
+                # Close top bar first to keep final line order stable.
+                infer_pbar.close()
+                post_pbar.close()
+        else:
+            with tqdm(
+                total=len(records),
+                desc="Inference",
+                unit="seq",
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
+            ) as infer_pbar:
+                results = process_sequences_on_gpu(
+                    records,
+                    model,
+                    tokenizer,
+                    device,
+                    max_length,
+                    overlap_length,
+                    micro_batch_size,
+                    infer_progress_bar=infer_pbar,
+                    postprocess_workers=single_postprocess_workers,
+                    enable_postprocess=enable_postprocess,
+                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                    postprocess_min_length=postprocess_min_length,
+                )
         
         return results
     
@@ -1064,61 +1253,130 @@ def annotate_fasta(
 
     # Distribute sequences evenly across GPUs
     gpu_sequences = distribute_sequences_to_gpus(records, gpu_count)
+    active_gpu_ids = [gpu_id for gpu_id in range(gpu_count) if gpu_sequences[gpu_id]]
+    active_gpu_count = len(active_gpu_ids)
+    gpu_processes = active_gpu_count
+    multi_postprocess_workers = max(1, cpu_budget - gpu_processes) if enable_postprocess else 0
 
     # Create queues for results and progress
     result_queue = mp.Queue()
-    progress_queue = mp.Queue()
+    infer_progress_queue = mp.Queue()
+    postprocess_progress_queue = mp.Queue() if enable_postprocess else None
 
     # Start worker processes
     processes = []
-    for gpu_id in range(gpu_count):
-        if gpu_id < len(gpu_sequences) and gpu_sequences[gpu_id]:
-            p = mp.Process(
-                target=worker_process,
-                args=(
-                    gpu_id,
-                    model_name,
-                    dtype_str,
-                    gpu_sequences[gpu_id],
-                    max_length,
-                    overlap_length,
-                    micro_batch_size,
+    for gpu_id in active_gpu_ids:
+        p = mp.Process(
+            target=worker_process,
+            args=(
+                gpu_id,
+                model_name,
+                dtype_str,
+                gpu_sequences[gpu_id],
+                max_length,
+                overlap_length,
+                micro_batch_size,
                     enable_postprocess,
                     postprocess_stair_outward_shift,
                     postprocess_stair_inward_shift,
                     postprocess_min_length,
+                    multi_postprocess_workers,
                     result_queue,
-                    progress_queue,
+                    infer_progress_queue,
+                    postprocess_progress_queue,
                 ),
-            )
-            p.start()
-            processes.append(p)
+        )
+        p.start()
+        processes.append(p)
 
-    # Collect results with progress bar
+    # Collect results with progress bars
     total_sequences = len(records)
     results = [None] * gpu_count  # Store results by GPU ID
-    
-    with tqdm(total=total_sequences, desc="Processing sequences", unit="seq") as pbar:
-        completed = 0
-        while completed < total_sequences:
-            # Update progress from progress queue
-            while not progress_queue.empty():
-                processed_count = progress_queue.get()
-                pbar.update(processed_count)
-                completed += processed_count
-            
-            # Check for results
-            if not result_queue.empty():
-                result_item = result_queue.get()
-                if result_item[0] == "error":
-                    _, err_gpu_id, err_msg = result_item
-                    print(f"❌ Worker error on GPU {err_gpu_id}: {err_msg}")
-                    continue
+    expected_results = len(processes)
+    received_results = 0
 
-                gpu_id, gpu_results = result_item
-                results[gpu_id] = gpu_results
-            
-            time.sleep(0.1)  # Small delay to prevent busy waiting
+    if enable_postprocess:
+        infer_pbar = tqdm(
+            total=total_sequences,
+            desc="Inference",
+            unit="seq",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        post_pbar = tqdm(
+            total=total_sequences,
+            desc="Postprocessing",
+            unit="seq",
+            position=1,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        try:
+            completed_infer = 0
+            completed_post = 0
+            while (
+                received_results < expected_results
+                or completed_infer < total_sequences
+                or completed_post < total_sequences
+            ):
+                while not infer_progress_queue.empty():
+                    infer_progress_queue.get()
+                    infer_pbar.update(1)
+                    completed_infer += 1
+                while postprocess_progress_queue is not None and not postprocess_progress_queue.empty():
+                    postprocess_progress_queue.get()
+                    post_pbar.update(1)
+                    completed_post += 1
+
+                while not result_queue.empty():
+                    result_item = result_queue.get()
+                    if result_item[0] == "error":
+                        _, err_gpu_id, err_msg = result_item
+                        raise RuntimeError(f"Worker error on GPU {err_gpu_id}: {err_msg}")
+                    gpu_id, gpu_results = result_item
+                    results[gpu_id] = gpu_results
+                    received_results += 1
+
+                time.sleep(0.05)
+
+            infer_pbar.n = total_sequences
+            infer_pbar.refresh()
+            post_pbar.n = total_sequences
+            post_pbar.refresh()
+        finally:
+            # Close top bar first to keep final line order stable.
+            infer_pbar.close()
+            post_pbar.close()
+    else:
+        with tqdm(
+            total=total_sequences,
+            desc="Inference",
+            unit="seq",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+        ) as infer_pbar:
+            completed_infer = 0
+            while received_results < expected_results or completed_infer < total_sequences:
+                while not infer_progress_queue.empty():
+                    infer_progress_queue.get()
+                    infer_pbar.update(1)
+                    completed_infer += 1
+
+                while not result_queue.empty():
+                    result_item = result_queue.get()
+                    if result_item[0] == "error":
+                        _, err_gpu_id, err_msg = result_item
+                        raise RuntimeError(f"Worker error on GPU {err_gpu_id}: {err_msg}")
+                    gpu_id, gpu_results = result_item
+                    results[gpu_id] = gpu_results
+                    received_results += 1
+
+                time.sleep(0.05)
+
+            infer_pbar.n = total_sequences
+            infer_pbar.refresh()
 
     # Wait for all processes to finish
     for p in processes:
@@ -1285,13 +1543,15 @@ def main() -> None:
     postprocess_stair_outward_shift = args.postprocess_stair_outward_shift
     postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
     postprocess_min_length = args.postprocess_min_length
+    cpu_count = args.cpu_count
 
     if enable_postprocess:
         print(
             "🎯 Postprocess enabled: "
             f"outward_shift={postprocess_stair_outward_shift}, "
             f"inward_shift={postprocess_stair_inward_shift}, "
-            f"min_length={postprocess_min_length}"
+            f"min_length={postprocess_min_length}, "
+            f"cpu_count={cpu_count}"
         )
     else:
         print("🎯 Postprocess disabled: using argmax only")
@@ -1330,6 +1590,7 @@ def main() -> None:
             postprocess_stair_outward_shift=postprocess_stair_outward_shift,
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
             postprocess_min_length=postprocess_min_length,
+            cpu_count=cpu_count,
         )
 
         head_names = ["positive_strand", "negative_strand"]
