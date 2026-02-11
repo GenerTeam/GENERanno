@@ -1286,8 +1286,8 @@ def main() -> None:
     if enable_postprocess:
         print(
             "🎯 Postprocess enabled: "
-            f"max_shift={postprocess_stair_outward_shift}, "
-            f"inner_shift={postprocess_stair_inward_shift}, "
+            f"outward_shift={postprocess_stair_outward_shift}, "
+            f"inward_shift={postprocess_stair_inward_shift}, "
             f"min_length={postprocess_min_length}"
         )
     else:
