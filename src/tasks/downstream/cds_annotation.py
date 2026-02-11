@@ -634,6 +634,9 @@ def read_sequences_from_parquet(
     elif "label_plus" in df.columns and "label_minus" in df.columns:
         labels = [np.concatenate([x, y]) for x, y in zip(df["label_plus"].tolist(), df["label_minus"].tolist())]
         print(f"✅ Found ground truth labels in 'label_plus' and 'label_minus' columns")
+    elif "label+" in df.columns and "label-" in df.columns:
+        labels = [np.concatenate([x, y]) for x, y in zip(df["label+"].tolist(), df["label-"].tolist())]
+        print(f"✅ Found ground truth labels in 'label+' and 'label-' columns")
 
     records: List[Tuple[str, str]] = []
     for i, (seq, header_val) in enumerate(zip(sequences, headers)):
@@ -888,13 +891,6 @@ def process_sequences_on_gpu(
             if target_sequences > sequences_processed:
                 progress_bar.update(target_sequences - sequences_processed)
                 sequences_processed = target_sequences
-
-    # Step 3: Reconstruct annotations for sequences on this GPU
-    if progress_bar is not None:
-        # Ensure progress bar reaches 100%
-        remaining = len(sequences) - sequences_processed
-        if remaining > 0:
-            progress_bar.update(remaining)
     
     gpu_annotated_records = []
     for h in range(num_heads):
@@ -937,6 +933,13 @@ def process_sequences_on_gpu(
             assert len(annot) == len(seq)
             head_annotations.append((header, annot))
         gpu_annotated_records.append(head_annotations)
+
+    # Step 3: Reconstruct annotations for sequences on this GPU
+    if progress_bar is not None:
+        # Ensure progress bar reaches 100%
+        remaining = len(sequences) - sequences_processed
+        if remaining > 0:
+            progress_bar.update(remaining)
 
     return gpu_annotated_records
 
