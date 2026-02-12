@@ -101,7 +101,7 @@ python src/tasks/downstream/cds_annotation.py \
 
 # FASTA input
 python src/tasks/downstream/cds_annotation.py \
-  --organism eukaryote \
+  --organism prokaryote \
   --input hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta
 ```
 
