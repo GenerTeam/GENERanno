@@ -2,10 +2,11 @@ import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import datetime
-import queue
+import signal
+import threading
 import time
-from collections import deque
 from typing import Dict, IO, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -409,27 +410,6 @@ def postprocess_sequence_predictions(
     return seq_idx, refined_preds_per_head
 
 
-def postprocess_sequence_task(
-    seq_idx: int,
-    argmax_preds_per_head: List[np.ndarray],
-    class1_conf_per_head: List[Optional[np.ndarray]],
-    postprocess_stair_outward_shift: int,
-    postprocess_stair_inward_shift: int,
-    postprocess_min_length: int,
-    result_queue: mp.Queue,
-) -> None:
-    result_queue.put(
-        postprocess_sequence_predictions(
-            seq_idx=seq_idx,
-            argmax_preds_per_head=argmax_preds_per_head,
-            class1_conf_per_head=class1_conf_per_head,
-            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-            postprocess_min_length=postprocess_min_length,
-        )
-    )
-
-
 def setup_model_for_gpu(
     model_name: str, gpu_id: int, dtype_str: str
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizer, torch.device]:
@@ -686,13 +666,13 @@ def read_sequences_from_parquet(
     labels = None
     if "label_cds" in df.columns:
         labels = df["label_cds"].tolist()
-        print(f"✅ Found ground truth labels in 'label_cds' column")
+        print("✅ Found ground truth labels in 'label_cds' column")
     elif "label_plus" in df.columns and "label_minus" in df.columns:
         labels = [np.concatenate([x, y]) for x, y in zip(df["label_plus"].tolist(), df["label_minus"].tolist())]
-        print(f"✅ Found ground truth labels in 'label_plus' and 'label_minus' columns")
+        print("✅ Found ground truth labels in 'label_plus' and 'label_minus' columns")
     elif "label+" in df.columns and "label-" in df.columns:
         labels = [np.concatenate([x, y]) for x, y in zip(df["label+"].tolist(), df["label-"].tolist())]
-        print(f"✅ Found ground truth labels in 'label+' and 'label-' columns")
+        print("✅ Found ground truth labels in 'label+' and 'label-' columns")
 
     records: List[Tuple[str, str]] = []
     for i, (seq, header_val) in enumerate(zip(sequences, headers)):
@@ -835,10 +815,7 @@ def process_sequences_on_gpu(
     max_length: int,
     overlap_length: int,
     micro_batch_size: int,
-    infer_progress_bar: tqdm = None,
-    postprocess_progress_bar: tqdm = None,
-    infer_progress_queue: Optional[mp.Queue] = None,
-    postprocess_progress_queue: Optional[mp.Queue] = None,
+    progress_event_queue: mp.Queue,
     postprocess_workers: int = 1,
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
@@ -855,7 +832,6 @@ def process_sequences_on_gpu(
         device: Computation device (CPU or GPU)
         max_length: Maximum sequence length for chunking
         micro_batch_size: Batch size for model inference
-        infer_progress_bar: Optional inference progress bar to update
 
     Returns:
         A list of lists of (header, annotation) tuples for the sequences
@@ -869,24 +845,19 @@ def process_sequences_on_gpu(
     overlap_char_length = overlap_length * tokenizer_k
     num_sequences = len(sequences)
     annotations_per_head = [[""] * num_sequences for _ in range(num_heads)]
-    postprocess_limit = max(0, int(postprocess_workers))
-    postprocess_result_queue: Optional[mp.Queue] = None
-    active_post_processes: Dict[int, mp.Process] = {}
-    waiting_post_tasks = deque()
-    if enable_postprocess and postprocess_limit > 0:
-        postprocess_result_queue = mp.Queue()
+    postprocess_executor: Optional[ProcessPoolExecutor] = None
+    pending_post_futures: set[object] = set()
+    if enable_postprocess:
+        postprocess_executor = ProcessPoolExecutor(max_workers=postprocess_workers)
 
     def update_infer_progress() -> None:
-        if infer_progress_bar is not None:
-            infer_progress_bar.update(1)
-        elif infer_progress_queue is not None:
-            infer_progress_queue.put(1)
+        progress_event_queue.put("infer")
 
-    def update_post_progress() -> None:
-        if postprocess_progress_bar is not None:
-            postprocess_progress_bar.update(1)
-        elif postprocess_progress_queue is not None:
-            postprocess_progress_queue.put(1)
+    def notify_postprocess_done(fut: object) -> None:
+        if fut.cancelled():
+            return
+        if fut.exception() is None:
+            progress_event_queue.put("post")
 
     def assign_sequence_annotations(seq_idx: int, preds_per_head: List[np.ndarray]) -> None:
         header, seq = sequences[seq_idx]
@@ -897,61 +868,24 @@ def process_sequences_on_gpu(
             annotations_per_head[h][seq_idx] = annot
 
     def collect_postprocess_result(block: bool = False) -> bool:
-        if postprocess_result_queue is None:
+        if not pending_post_futures:
             return False
-        if not active_post_processes:
-            return False
+        future_list = list(pending_post_futures)
         if block:
-            seq_idx, final_preds_per_head = postprocess_result_queue.get()
+            done, _ = wait(future_list, return_when=FIRST_COMPLETED)
         else:
-            try:
-                seq_idx, final_preds_per_head = postprocess_result_queue.get_nowait()
-            except queue.Empty:
-                return False
-        assign_sequence_annotations(seq_idx, final_preds_per_head)
-        proc = active_post_processes.pop(seq_idx, None)
-        if proc is not None:
-            proc.join()
-        update_post_progress()
+            done, _ = wait(future_list, timeout=0.0, return_when=FIRST_COMPLETED)
+        if not done:
+            return False
+        for fut in done:
+            pending_post_futures.discard(fut)
+            seq_idx, final_preds_per_head = fut.result()
+            assign_sequence_annotations(seq_idx, final_preds_per_head)
         return True
 
-    def try_start_waiting_postprocess_tasks() -> None:
-        if postprocess_result_queue is None:
-            return
-        while waiting_post_tasks and len(active_post_processes) < postprocess_limit:
-            (
-                seq_idx,
-                argmax_preds_per_head,
-                class1_conf_per_head,
-            ) = waiting_post_tasks.popleft()
-            proc = mp.Process(
-                target=postprocess_sequence_task,
-                args=(
-                    seq_idx,
-                    argmax_preds_per_head,
-                    class1_conf_per_head,
-                    postprocess_stair_outward_shift,
-                    postprocess_stair_inward_shift,
-                    postprocess_min_length,
-                    postprocess_result_queue,
-                ),
-            )
-            proc.start()
-            active_post_processes[seq_idx] = proc
-
     def pump_postprocess_nonblocking() -> None:
-        if postprocess_result_queue is None:
-            return
-        while True:
-            progressed = False
-            while collect_postprocess_result(block=False):
-                progressed = True
-            active_before = len(active_post_processes)
-            try_start_waiting_postprocess_tasks()
-            if len(active_post_processes) != active_before:
-                progressed = True
-            if not progressed:
-                break
+        while collect_postprocess_result(block=False):
+            pass
 
     try:
         for seq_idx, (_, seq) in enumerate(sequences):
@@ -993,7 +927,7 @@ def process_sequences_on_gpu(
                     else:
                         seq_work = seq_work[max_char_length - overlap_char_length:]
 
-            probs_per_head_flat = [[] for _ in range(num_heads)]
+            probs_per_head_chunks: List[List[torch.Tensor]] = [[] for _ in range(num_heads)]
             total_chunks = len(seq_chunks)
             for start in range(0, total_chunks, micro_batch_size):
                 end = min(start + micro_batch_size, total_chunks)
@@ -1003,28 +937,26 @@ def process_sequences_on_gpu(
                 probs = logits.softmax(dim=-1).cpu()
 
                 for i in range(probs.shape[0]):
-                    mask = att[i].cpu()
-                    valid_len = int(mask.sum()) * tokenizer_k
+                    valid_len = int(att[i].sum().item()) * tokenizer_k
                     total_pred_len = valid_len * num_heads
-                    chunk_probs_all_heads = probs[i, :total_pred_len].tolist()
+                    chunk_probs_all_heads = probs[i, :total_pred_len]
+                    chunk_probs_all_heads = chunk_probs_all_heads.view(num_heads, valid_len, -1)
                     for h in range(num_heads):
-                        start_idx = h * valid_len
-                        end_idx = (h + 1) * valid_len
-                        probs_per_head_flat[h].extend(chunk_probs_all_heads[start_idx:end_idx])
-                if enable_postprocess and postprocess_result_queue is not None:
+                        probs_per_head_chunks[h].append(chunk_probs_all_heads[h])
+                if enable_postprocess:
                     pump_postprocess_nonblocking()
 
             argmax_preds_per_head: List[np.ndarray] = []
             class1_conf_per_head: List[Optional[np.ndarray]] = []
             seq_len = len(seq)
             for h in range(num_heads):
-                seq_probs = probs_per_head_flat[h]
-                final_seq_probs = torch.zeros(seq_len, len(seq_probs[0]))
+                seq_probs = torch.cat(probs_per_head_chunks[h], dim=0).float()
+                final_seq_probs = torch.zeros(seq_len, seq_probs.shape[1], dtype=torch.float32)
                 overlap_cnt = torch.zeros(seq_len, dtype=torch.long)
                 for orig_start_pos, new_start_pos, char_length in seq_chunk_pos:
-                    final_seq_probs[new_start_pos:new_start_pos + char_length] += torch.as_tensor(
-                        seq_probs[orig_start_pos:orig_start_pos + char_length]
-                    )
+                    final_seq_probs[new_start_pos:new_start_pos + char_length] += seq_probs[
+                        orig_start_pos:orig_start_pos + char_length
+                    ]
                     overlap_cnt[new_start_pos:new_start_pos + char_length] += 1
                 final_seq_probs /= overlap_cnt.unsqueeze(-1)
 
@@ -1036,39 +968,30 @@ def process_sequences_on_gpu(
                     class1_conf_per_head.append(None)
 
             update_infer_progress()
-            if enable_postprocess and postprocess_result_queue is not None:
-                waiting_post_tasks.append(
-                    (seq_idx, argmax_preds_per_head, class1_conf_per_head)
+            if enable_postprocess:
+                assert postprocess_executor is not None
+                fut = postprocess_executor.submit(
+                    postprocess_sequence_predictions,
+                    seq_idx,
+                    argmax_preds_per_head,
+                    class1_conf_per_head,
+                    postprocess_stair_outward_shift,
+                    postprocess_stair_inward_shift,
+                    postprocess_min_length,
                 )
+                fut.add_done_callback(notify_postprocess_done)
+                pending_post_futures.add(fut)
                 pump_postprocess_nonblocking()
-            elif enable_postprocess:
-                final_preds_per_head = postprocess_sequence_predictions(
-                    argmax_preds_per_head=argmax_preds_per_head,
-                    class1_conf_per_head=class1_conf_per_head,
-                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-                    postprocess_min_length=postprocess_min_length,
-                )
-                assign_sequence_annotations(seq_idx, final_preds_per_head)
-                update_post_progress()
             else:
                 assign_sequence_annotations(seq_idx, argmax_preds_per_head)
 
-        if enable_postprocess and postprocess_result_queue is not None:
-            while waiting_post_tasks or active_post_processes:
-                try_start_waiting_postprocess_tasks()
-                if not collect_postprocess_result(block=False):
+            if enable_postprocess:
+                while pending_post_futures:
                     collect_postprocess_result(block=True)
     finally:
-        for seq_idx, proc in list(active_post_processes.items()):
-            if proc.is_alive():
-                proc.terminate()
-            proc.join()
-            active_post_processes.pop(seq_idx, None)
-        waiting_post_tasks.clear()
-        if postprocess_result_queue is not None:
-            postprocess_result_queue.close()
-            postprocess_result_queue.join_thread()
+        if enable_postprocess:
+            assert postprocess_executor is not None
+            postprocess_executor.shutdown(wait=True, cancel_futures=False)
 
     gpu_annotated_records: List[List[Tuple[str, str]]] = [[] for _ in range(num_heads)]
     for h in range(num_heads):
@@ -1077,11 +1000,10 @@ def process_sequences_on_gpu(
     return gpu_annotated_records
 
 
-def worker_process(
+def persistent_worker_process(
     gpu_id: int,
     model_name: str,
     dtype_str: str,
-    sequences: List[Tuple[str, str]],
     max_length: int,
     overlap_length: int,
     micro_batch_size: int,
@@ -1090,51 +1012,122 @@ def worker_process(
     postprocess_stair_inward_shift: int,
     postprocess_min_length: int,
     postprocess_workers: int,
+    task_queue: mp.Queue,
     result_queue: mp.Queue,
-    infer_progress_queue: mp.Queue,
-    postprocess_progress_queue: Optional[mp.Queue],
-):
-    """
-    Worker process that runs on a specific GPU.
-
-    Args:
-        gpu_id: GPU device ID to use
-        model_name: HuggingFace model name
-        sequences: List of sequences to process on this GPU
-        max_length: Maximum sequence length
-        micro_batch_size: Batch size for inference
-        result_queue: Queue to put results in
-        infer_progress_queue: Queue to report completed inference sequences
-        postprocess_progress_queue: Queue to report completed postprocessed sequences
-    """
+    progress_event_queue: mp.Queue,
+    ) -> None:
+    job_id = -1
     try:
-        # Setup model for this GPU
-        model, tokenizer, device = setup_model_for_gpu(model_name, gpu_id, dtype_str)
-        
-        # Process sequences assigned to this GPU (no progress bar in worker processes)
-        gpu_results = process_sequences_on_gpu(
-            sequences,
-            model,
-            tokenizer,
-            device,
-            max_length,
-            overlap_length,
-            micro_batch_size,
-            infer_progress_bar=None,
-            postprocess_progress_bar=None,
-            infer_progress_queue=infer_progress_queue,
-            postprocess_progress_queue=postprocess_progress_queue,
-            postprocess_workers=postprocess_workers,
-            enable_postprocess=enable_postprocess,
-            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-            postprocess_min_length=postprocess_min_length,
-        )
-        result_queue.put((gpu_id, gpu_results))
-            
+        model = None
+        tokenizer = None
+        device = None
+
+        while True:
+            task_item = task_queue.get()
+            if task_item is None:
+                break
+
+            job_id, sequences = task_item
+            if model is None:
+                model, tokenizer, device = setup_model_for_gpu(model_name, gpu_id, dtype_str)
+            gpu_results = process_sequences_on_gpu(
+                sequences,
+                model,
+                tokenizer,
+                device,
+                max_length,
+                overlap_length,
+                micro_batch_size,
+                progress_event_queue=progress_event_queue,
+                postprocess_workers=postprocess_workers,
+                enable_postprocess=enable_postprocess,
+                postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_min_length=postprocess_min_length,
+            )
+            result_queue.put(("ok", job_id, gpu_id, gpu_results))
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
-        print(f"❌ Error in GPU {gpu_id} worker: {e}")
-        result_queue.put(("error", gpu_id, str(e)))
+        print(f"❌ Error in persistent GPU {gpu_id} worker: {e}")
+        result_queue.put(("error", job_id, gpu_id, str(e)))
+
+
+def create_persistent_worker_runtime(
+    model_name: str,
+    dtype_str: str,
+    gpu_count: int,
+    max_length: int,
+    overlap_length: int,
+    micro_batch_size: int,
+    enable_postprocess: bool,
+    postprocess_stair_outward_shift: int,
+    postprocess_stair_inward_shift: int,
+    postprocess_min_length: int,
+    cpu_count: int,
+) -> Dict[str, object]:
+    cpu_budget = int(cpu_count)
+    post_workers_total = 0
+    post_workers_per_gpu = [0] * gpu_count
+    if enable_postprocess:
+        post_workers_total = max(1, cpu_budget - gpu_count - 1)
+        base = post_workers_total // gpu_count
+        remainder = post_workers_total % gpu_count
+        for gpu_id in range(gpu_count):
+            post_workers_per_gpu[gpu_id] = base + (1 if gpu_id < remainder else 0)
+        for gpu_id in range(gpu_count):
+            post_workers_per_gpu[gpu_id] = max(1, post_workers_per_gpu[gpu_id])
+        post_workers_total = sum(post_workers_per_gpu)
+        print(
+            f"🧠 post_workers_total={post_workers_total} "
+            f"(budget={cpu_budget}, gpu_processes={gpu_count}, main=1)"
+        )
+
+    task_queues = [mp.Queue() for _ in range(gpu_count)]
+    result_queue = mp.Queue()
+    progress_event_queue = mp.Queue()
+
+    processes: List[mp.Process] = []
+    for gpu_id in range(gpu_count):
+        p = mp.Process(
+            target=persistent_worker_process,
+            args=(
+                gpu_id,
+                model_name,
+                dtype_str,
+                max_length,
+                overlap_length,
+                micro_batch_size,
+                enable_postprocess,
+                postprocess_stair_outward_shift,
+                postprocess_stair_inward_shift,
+                postprocess_min_length,
+                post_workers_per_gpu[gpu_id],
+                task_queues[gpu_id],
+                result_queue,
+                progress_event_queue,
+            ),
+        )
+        p.start()
+        processes.append(p)
+
+    return {
+        "gpu_count": gpu_count,
+        "task_queues": task_queues,
+        "result_queue": result_queue,
+        "progress_event_queue": progress_event_queue,
+        "processes": processes,
+        "next_job_id": 0,
+    }
+
+
+def shutdown_persistent_worker_runtime(runtime: Dict[str, object]) -> None:
+    processes = runtime["processes"]
+    for p in processes:
+        if p.is_alive() and p.pid is not None:
+            os.kill(p.pid, signal.SIGINT)
+    for p in processes:
+        p.join()
 
 
 def annotate_fasta(
@@ -1150,6 +1143,7 @@ def annotate_fasta(
     postprocess_stair_inward_shift: int = 16,
     postprocess_min_length: int = 4,
     cpu_count: int = max(1, int((os.cpu_count() or 1) * 0.8)),
+    persistent_runtime: Optional[Dict[str, object]] = None,
 ) -> List[List[Tuple[str, str]]]:
     """
     Annotate sequences using single or multiple GPUs with independent model loading.
@@ -1165,238 +1159,123 @@ def annotate_fasta(
     Returns:
         A list of lists of (header, annotation) tuples
     """
-    # Single GPU case - process directly with sequence-level progress bars
-    cpu_budget = int(cpu_count)
-    if gpu_count <= 1:
-        gpu_processes = 1
-        single_postprocess_workers = max(1, cpu_budget - gpu_processes) if enable_postprocess else 0
-
-        if torch.cuda.is_available() and gpu_count == 1:
-            print("💻 Using single GPU processing")
-            gpu_id = 0
-        else:
-            print("💻 Using single CPU processing. This could be SLOW!!!")
-            gpu_id = -1
-        
-        model, tokenizer, device = setup_model_for_gpu(model_name, gpu_id, dtype_str)
-        
-        print(f"🧬 Processing {len(records)} sequences on {device}")
-        
-        if enable_postprocess:
-            infer_pbar = tqdm(
-                total=len(records),
-                desc="Inference",
-                unit="seq",
-                position=0,
-                leave=True,
-                dynamic_ncols=True,
-            )
-            post_pbar = tqdm(
-                total=len(records),
-                desc="Postprocessing",
-                unit="seq",
-                position=1,
-                leave=True,
-                dynamic_ncols=True,
-            )
-            try:
-                results = process_sequences_on_gpu(
-                    records,
-                    model,
-                    tokenizer,
-                    device,
-                    max_length,
-                    overlap_length,
-                    micro_batch_size,
-                    infer_progress_bar=infer_pbar,
-                    postprocess_progress_bar=post_pbar,
-                    postprocess_workers=single_postprocess_workers,
-                    enable_postprocess=enable_postprocess,
-                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-                    postprocess_min_length=postprocess_min_length,
-                )
-            finally:
-                # Close top bar first to keep final line order stable.
-                infer_pbar.close()
-                post_pbar.close()
-        else:
-            with tqdm(
-                total=len(records),
-                desc="Inference",
-                unit="seq",
-                position=0,
-                leave=True,
-                dynamic_ncols=True,
-            ) as infer_pbar:
-                results = process_sequences_on_gpu(
-                    records,
-                    model,
-                    tokenizer,
-                    device,
-                    max_length,
-                    overlap_length,
-                    micro_batch_size,
-                    infer_progress_bar=infer_pbar,
-                    postprocess_workers=single_postprocess_workers,
-                    enable_postprocess=enable_postprocess,
-                    postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-                    postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-                    postprocess_min_length=postprocess_min_length,
-                )
-        
-        return results
-    
-    # Multi-GPU case - use multiprocessing
-    print(f"🚀 Starting parallel processing with {gpu_count} GPUs")
-    print(f"📊 Distributing {len(records)} sequences across {gpu_count} GPUs")
-
-    # Distribute sequences evenly across GPUs
-    gpu_sequences = distribute_sequences_to_gpus(records, gpu_count)
-    active_gpu_ids = [gpu_id for gpu_id in range(gpu_count) if gpu_sequences[gpu_id]]
-    active_gpu_count = len(active_gpu_ids)
-    gpu_processes = active_gpu_count
-    multi_postprocess_workers = max(1, cpu_budget - gpu_processes) if enable_postprocess else 0
-
-    # Create queues for results and progress
-    result_queue = mp.Queue()
-    infer_progress_queue = mp.Queue()
-    postprocess_progress_queue = mp.Queue() if enable_postprocess else None
-
-    # Start worker processes
-    processes = []
-    for gpu_id in active_gpu_ids:
-        p = mp.Process(
-            target=worker_process,
-            args=(
-                gpu_id,
-                model_name,
-                dtype_str,
-                gpu_sequences[gpu_id],
-                max_length,
-                overlap_length,
-                micro_batch_size,
-                    enable_postprocess,
-                    postprocess_stair_outward_shift,
-                    postprocess_stair_inward_shift,
-                    postprocess_min_length,
-                    multi_postprocess_workers,
-                    result_queue,
-                    infer_progress_queue,
-                    postprocess_progress_queue,
-                ),
+    owns_runtime = False
+    runtime = persistent_runtime
+    if runtime is None:
+        print(f"🚀 Starting persistent GPU workers ({gpu_count} GPUs)")
+        runtime = create_persistent_worker_runtime(
+            model_name=model_name,
+            dtype_str=dtype_str,
+            gpu_count=gpu_count,
+            max_length=max_length,
+            overlap_length=overlap_length,
+            micro_batch_size=micro_batch_size,
+            enable_postprocess=enable_postprocess,
+            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+            postprocess_min_length=postprocess_min_length,
+            cpu_count=cpu_count,
         )
-        p.start()
-        processes.append(p)
-
-    # Collect results with progress bars
-    total_sequences = len(records)
-    results = [None] * gpu_count  # Store results by GPU ID
-    expected_results = len(processes)
-    received_results = 0
-
-    if enable_postprocess:
-        infer_pbar = tqdm(
-            total=total_sequences,
-            desc="Inference",
-            unit="seq",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-        )
-        post_pbar = tqdm(
-            total=total_sequences,
-            desc="Postprocessing",
-            unit="seq",
-            position=1,
-            leave=True,
-            dynamic_ncols=True,
-        )
-        try:
-            completed_infer = 0
-            completed_post = 0
-            while (
-                received_results < expected_results
-                or completed_infer < total_sequences
-                or completed_post < total_sequences
-            ):
-                while not infer_progress_queue.empty():
-                    infer_progress_queue.get()
-                    infer_pbar.update(1)
-                    completed_infer += 1
-                while postprocess_progress_queue is not None and not postprocess_progress_queue.empty():
-                    postprocess_progress_queue.get()
-                    post_pbar.update(1)
-                    completed_post += 1
-
-                while not result_queue.empty():
-                    result_item = result_queue.get()
-                    if result_item[0] == "error":
-                        _, err_gpu_id, err_msg = result_item
-                        raise RuntimeError(f"Worker error on GPU {err_gpu_id}: {err_msg}")
-                    gpu_id, gpu_results = result_item
-                    results[gpu_id] = gpu_results
-                    received_results += 1
-
-                time.sleep(0.05)
-
-            infer_pbar.n = total_sequences
-            infer_pbar.refresh()
-            post_pbar.n = total_sequences
-            post_pbar.refresh()
-        finally:
-            # Close top bar first to keep final line order stable.
-            infer_pbar.close()
-            post_pbar.close()
+        owns_runtime = True
     else:
-        with tqdm(
-            total=total_sequences,
-            desc="Inference",
-            unit="seq",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-        ) as infer_pbar:
-            completed_infer = 0
-            while received_results < expected_results or completed_infer < total_sequences:
-                while not infer_progress_queue.empty():
-                    infer_progress_queue.get()
+        print(f"🚀 Reusing persistent GPU workers ({gpu_count} GPUs)")
+
+    if int(runtime["gpu_count"]) != gpu_count:
+        raise ValueError(
+            f"persistent runtime gpu_count={runtime['gpu_count']} does not match requested gpu_count={gpu_count}"
+        )
+
+    interrupted = False
+    try:
+        print(f"📊 Distributing {len(records)} sequences across {gpu_count} GPUs")
+        gpu_sequences = distribute_sequences_to_gpus(records, gpu_count)
+        active_gpu_ids = [gpu_id for gpu_id in range(gpu_count) if gpu_sequences[gpu_id]]
+
+        result_queue = runtime["result_queue"]
+        progress_event_queue = runtime["progress_event_queue"]
+        task_queues = runtime["task_queues"]
+
+        job_id = runtime["next_job_id"]
+        runtime["next_job_id"] = job_id + 1
+        for gpu_id in active_gpu_ids:
+            task_queues[gpu_id].put((job_id, gpu_sequences[gpu_id]))
+
+        total_sequences = len(records)
+        results = [None] * gpu_count
+        expected_results = len(active_gpu_ids)
+        received_results = 0
+
+        def progress_worker() -> None:
+            infer_pbar = tqdm(
+                total=total_sequences,
+                desc="Inference",
+                unit="seq",
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
+                miniters=1,
+                mininterval=0.0,
+            )
+            post_pbar: Optional[tqdm] = None
+            if enable_postprocess:
+                post_pbar = tqdm(
+                    total=total_sequences,
+                    desc="Postprocessing",
+                    unit="seq",
+                    position=1,
+                    leave=True,
+                    dynamic_ncols=True,
+                    miniters=1,
+                    mininterval=0.0,
+                )
+
+            while infer_pbar.n < infer_pbar.total or (
+                post_pbar is not None and post_pbar.n < post_pbar.total
+            ):
+                event_type = progress_event_queue.get()
+                if event_type == "stop":
+                    break
+                if event_type == "infer":
                     infer_pbar.update(1)
-                    completed_infer += 1
+                elif event_type == "post":
+                    post_pbar.update(1)
+            
+            infer_pbar.close()
+            if post_pbar is not None:
+                post_pbar.close()
 
-                while not result_queue.empty():
-                    result_item = result_queue.get()
-                    if result_item[0] == "error":
-                        _, err_gpu_id, err_msg = result_item
-                        raise RuntimeError(f"Worker error on GPU {err_gpu_id}: {err_msg}")
-                    gpu_id, gpu_results = result_item
-                    results[gpu_id] = gpu_results
-                    received_results += 1
+        progress_thread = threading.Thread(target=progress_worker, daemon=True)
+        progress_thread.start()
+        try:
+            while received_results < expected_results:
+                state, result_job_id, result_gpu_id, payload = result_queue.get()
+                if state == "error":
+                    raise RuntimeError(f"Worker error on GPU {result_gpu_id}: {payload}")
+                if result_job_id != job_id:
+                    continue
+                results[result_gpu_id] = payload
+                received_results += 1
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
+        finally:
+            if interrupted:
+                progress_event_queue.put("stop")
+            progress_thread.join()
 
-                time.sleep(0.05)
+        print("🔗 Combining results from all GPUs...")
+        num_heads = len(results[0]) if results and results[0] is not None else 0
+        all_annotated_records = [[] for _ in range(num_heads)]
+        for gpu_id in range(gpu_count):
+            if results[gpu_id] is not None:
+                for head_idx in range(num_heads):
+                    all_annotated_records[head_idx].extend(results[gpu_id][head_idx])
 
-            infer_pbar.n = total_sequences
-            infer_pbar.refresh()
-
-    # Wait for all processes to finish
-    for p in processes:
-        p.join()
-
-    # Combine results from all GPUs in order
-    print("🔗 Combining results from all GPUs...")
-    
-    # Initialize empty lists for each head
-    num_heads = len(results[0]) if results[0] is not None else 0
-    all_annotated_records = [[] for _ in range(num_heads)]
-    
-    # Combine results in GPU order (which corresponds to sequence order)
-    for gpu_id in range(gpu_count):
-        if results[gpu_id] is not None:
-            for head_idx in range(num_heads):
-                all_annotated_records[head_idx].extend(results[gpu_id][head_idx])
-
-    print(f"✅ Successfully processed {len(records)} sequences across {gpu_count} GPUs")
-    return all_annotated_records
+        print(f"✅ Successfully processed {len(records)} sequences across {gpu_count} GPUs")
+        return all_annotated_records
+    finally:
+        if owns_runtime:
+            shutdown_persistent_worker_runtime(runtime)
 
 
 def display_progress_header() -> None:
@@ -1532,6 +1411,8 @@ def main() -> None:
 
     # Determine GPU count
     available_gpus = torch.cuda.device_count()
+    if available_gpus <= 0:
+        raise RuntimeError("No CUDA devices available.")
     if args.gpu_count == -1:
         gpu_count = available_gpus
     else:
@@ -1568,53 +1449,76 @@ def main() -> None:
     metrics_rows: List[Dict[str, object]] = []
     metrics_path = os.path.join(args.output_path, f"metrics_{run_timestamp}.csv")
 
-    for input_idx, input_path in enumerate(input_paths, start=1):
-        print(f"\n{'=' * 80}")
-        print(f"📂 Processing input {input_idx}/{len(input_paths)}: {input_path}")
-        print(f"{'=' * 80}")
+    persistent_runtime: Optional[Dict[str, object]] = None
+    try:
+        if gpu_count > 0:
+            print(f"🚀 Initializing persistent GPU workers ({gpu_count} GPUs)")
+            persistent_runtime = create_persistent_worker_runtime(
+                model_name=args.model_name,
+                dtype_str=dtype_str,
+                gpu_count=gpu_count,
+                max_length=args.context_length,
+                overlap_length=args.overlap_length,
+                micro_batch_size=args.batch_size,
+                enable_postprocess=enable_postprocess,
+                postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_min_length=postprocess_min_length,
+                cpu_count=cpu_count,
+            )
 
-        fasta_records, ground_truth_labels = read_input_records(
-            input_path, limit=args.limit
-        )
+        for input_idx, input_path in enumerate(input_paths, start=1):
+            print(f"\n{'=' * 80}")
+            print(f"📂 Processing input {input_idx}/{len(input_paths)}: {input_path}")
+            print(f"{'=' * 80}")
 
-        # Use unified annotate function for both single and multi-GPU
-        annotated_records_per_head = annotate_fasta(
-            fasta_records,
-            args.model_name,
-            dtype_str,
-            gpu_count,
-            max_length=args.context_length,
-            overlap_length=args.overlap_length,
-            micro_batch_size=args.batch_size,
-            enable_postprocess=enable_postprocess,
-            postprocess_stair_outward_shift=postprocess_stair_outward_shift,
-            postprocess_stair_inward_shift=postprocess_stair_inward_shift,
-            postprocess_min_length=postprocess_min_length,
-            cpu_count=cpu_count,
-        )
+            fasta_records, ground_truth_labels = read_input_records(
+                input_path, limit=args.limit
+            )
 
-        head_names = ["positive_strand", "negative_strand"]
+            # Use unified annotate function for both single and multi-GPU
+            annotated_records_per_head = annotate_fasta(
+                fasta_records,
+                args.model_name,
+                dtype_str,
+                gpu_count,
+                max_length=args.context_length,
+                overlap_length=args.overlap_length,
+                micro_batch_size=args.batch_size,
+                enable_postprocess=enable_postprocess,
+                postprocess_stair_outward_shift=postprocess_stair_outward_shift,
+                postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_min_length=postprocess_min_length,
+                cpu_count=cpu_count,
+                persistent_runtime=persistent_runtime,
+            )
 
-        input_filename = os.path.basename(input_path)
-        base_input_name = os.path.splitext(input_filename)[0]
+            head_names = ["positive_strand", "negative_strand"]
 
-        write_outputs_for_input(
-            annotated_records_per_head=annotated_records_per_head,
-            head_names=head_names,
-            base_input_name=base_input_name,
-            run_timestamp=run_timestamp,
-            output_path=args.output_path,
-            fasta_records=fasta_records,
-        )
+            input_filename = os.path.basename(input_path)
+            base_input_name = os.path.splitext(input_filename)[0]
 
-        metrics = calculate_metrics_for_input(
-            annotated_records_per_head=annotated_records_per_head,
-            fasta_records=fasta_records,
-            ground_truth_labels=ground_truth_labels,
-        )
-        if metrics is not None:
-            metrics_rows.append({"input_name": base_input_name, **metrics})
-            flush_metrics_csv(metrics_rows, metrics_path)
+            write_outputs_for_input(
+                annotated_records_per_head=annotated_records_per_head,
+                head_names=head_names,
+                base_input_name=base_input_name,
+                run_timestamp=run_timestamp,
+                output_path=args.output_path,
+                fasta_records=fasta_records,
+            )
+
+            metrics = calculate_metrics_for_input(
+                annotated_records_per_head=annotated_records_per_head,
+                fasta_records=fasta_records,
+                ground_truth_labels=ground_truth_labels,
+            )
+            if metrics is not None:
+                metrics_rows.append({"input_name": base_input_name, **metrics})
+                flush_metrics_csv(metrics_rows, metrics_path)
+    finally:
+        if persistent_runtime is not None:
+            print("🛑 Shutting down persistent GPU workers...")
+            shutdown_persistent_worker_runtime(persistent_runtime)
 
     # Print total execution time
     total_time = time.time() - total_start_time
