@@ -16,7 +16,11 @@
 
 ## 🔭 Overview
 
-![overview](figures/model_overview.png)
+<div align="center">
+  <img src="figures/model_overview.png" />
+  <img src="figures/eukaryotic_annotation.png" width="80%" />
+  <img src="figures/bacteria_annotation_summary.png" />
+</div>
 
 In this repository, we present GENERanno, a genomic foundation model featuring a context length of 8k base pairs and
 500M parameters, trained on an expansive dataset comprising 386 billion base pairs of eukaryotic DNA. Our evaluations
@@ -190,10 +194,6 @@ torchrun --nnodes=${NUM_NODES} \
 ```
 
 ## 📈 Benchmark Performance
-
-### Coding DNA Sequence (CDS) Annotation — `GENERanno-prokaryote-0.5b-cds-annotator-preview`
-![bacteria_annotation_summary](figures/bacteria_annotation_summary.png)
-The detailed annotation results are provived [here](https://huggingface.co/datasets/GenerTeam/cds-annotation).
 
 ### Sequence Understanding (Classification/Regression) — `GENERanno-prokaryote-0.5b-base`
 ![benchmarks](figures/prokaryotic_gener_tasks.png)
