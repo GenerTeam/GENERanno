@@ -79,6 +79,9 @@ python src/tasks/downstream/cds_annotation.py --organism eukaryote
 
 # Prokaryotic genome annotation
 python src/tasks/downstream/cds_annotation.py --organism prokaryote
+
+# Enable BF16 for faster inference (recommended if supported)
+python src/tasks/downstream/cds_annotation.py --organism eukaryote --bf16
 ```
 
 ##### Custom input
