@@ -144,41 +144,24 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
     start_precision, start_recall, start_f1 = calc(dp == 1, dt == 1)
     end_precision, end_recall, end_f1 = calc(dp == -1, dt == -1)
 
-    def build_interval_pairs(diff_arr: np.ndarray) -> np.ndarray:
-        starts = np.nonzero(diff_arr == 1)[0]
-        ends = np.nonzero(diff_arr == -1)[0]
-        pair_count = min(starts.shape[0], ends.shape[0])
-        if pair_count == 0:
-            return np.empty((0, 2), dtype=np.int64)
-        return np.stack((starts[:pair_count], ends[:pair_count]), axis=1)
+    true_start_indices = np.nonzero(dt == 1)[0]
+    true_end_indices = np.nonzero(dt == -1)[0]
+    true_rng = np.stack((true_start_indices, true_end_indices), axis=1)
+    pred_start_indices = np.nonzero(dp == 1)[0]
+    pred_end_indices = np.nonzero(dp == -1)[0]
+    pred_rng = np.stack((pred_start_indices, pred_end_indices), axis=1)
 
-    true_rng = build_interval_pairs(dt)
-    pred_rng = build_interval_pairs(dp)
-    true_set = {(int(s), int(e)) for s, e in true_rng}
-    pred_set = {(int(s), int(e)) for s, e in pred_rng}
-    true_count = len(true_set)
-    pred_count = len(pred_set)
-
-    if true_count == 0:
-        boundary_recall = 1.0
-        boundary_precision = 1.0 if pred_count == 0 else 0.0
-    else:
-        tp_boundary = len(true_set & pred_set)
-        boundary_recall = tp_boundary / true_count
-        boundary_precision = tp_boundary / pred_count if pred_count > 0 else 0.0
+    boundary_precision = (dt[pred_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(pred_rng) > 0 else 0.0
+    boundary_recall = (dp[true_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(true_rng) > 0 else 0.0
     boundary_f1 = (
         2 * boundary_precision * boundary_recall / (boundary_precision + boundary_recall)
-        if (boundary_precision + boundary_recall) > 0
-        else 0.0
+        if (boundary_precision + boundary_recall) > 0 else 0.0
     )
 
-    if len(true_rng) == 0:
-        exact_match = 1.0
-    else:
-        exact_match = (
-            (dp[true_rng] == np.array([1, -1])).all(axis=1) &
-            (np.diff(sp[true_rng + 1], axis=1) == np.diff(st[true_rng + 1], axis=1)).flatten()
-        ).mean().item()
+    exact_match = (
+        (dp[true_rng] == np.array([1, -1])).all(axis=1) &
+        (np.diff(sp[true_rng + 1], axis=1) == np.diff(st[true_rng + 1], axis=1)).flatten()
+    ).mean().item() if len(true_rng) > 0 else 0.0
 
     return {
         "precision": precision,
@@ -1121,13 +1104,30 @@ def create_persistent_worker_runtime(
     }
 
 
-def shutdown_persistent_worker_runtime(runtime: Dict[str, object]) -> None:
+def shutdown_persistent_worker_runtime(runtime: Dict[str, object], interrupted: bool = False) -> None:
+    task_queues = runtime["task_queues"]
+    result_queue = runtime["result_queue"]
+    progress_event_queue = runtime["progress_event_queue"]
     processes = runtime["processes"]
-    for p in processes:
-        if p.is_alive() and p.pid is not None:
-            os.kill(p.pid, signal.SIGINT)
+
+    if interrupted:
+        for p in processes:
+            if p.is_alive() and p.pid is not None:
+                os.kill(p.pid, signal.SIGINT)
+    else:
+        for task_queue in task_queues:
+            task_queue.put(None)
+
     for p in processes:
         p.join()
+
+    for q in task_queues:
+        q.close()
+        q.join_thread()
+    result_queue.close()
+    result_queue.join_thread()
+    progress_event_queue.close()
+    progress_event_queue.join_thread()
 
 
 def annotate_fasta(
@@ -1275,7 +1275,7 @@ def annotate_fasta(
         return all_annotated_records
     finally:
         if owns_runtime:
-            shutdown_persistent_worker_runtime(runtime)
+            shutdown_persistent_worker_runtime(runtime, interrupted=interrupted)
 
 
 def display_progress_header() -> None:
@@ -1450,6 +1450,7 @@ def main() -> None:
     metrics_path = os.path.join(args.output_path, f"metrics_{run_timestamp}.csv")
 
     persistent_runtime: Optional[Dict[str, object]] = None
+    interrupted = False
     try:
         if gpu_count > 0:
             print(f"🚀 Initializing persistent GPU workers ({gpu_count} GPUs)")
@@ -1515,10 +1516,13 @@ def main() -> None:
             if metrics is not None:
                 metrics_rows.append({"input_name": base_input_name, **metrics})
                 flush_metrics_csv(metrics_rows, metrics_path)
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     finally:
         if persistent_runtime is not None:
             print("🛑 Shutting down persistent GPU workers...")
-            shutdown_persistent_worker_runtime(persistent_runtime)
+            shutdown_persistent_worker_runtime(persistent_runtime, interrupted=interrupted)
 
     # Print total execution time
     total_time = time.time() - total_start_time
