@@ -120,7 +120,11 @@ def calc(pred_classes, valid_labels):
 
 
 def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
-    assert(pos_pred.shape == neg_pred.shape == pos_true.shape == neg_true.shape and pos_pred.ndim == 1)
+    if not (pos_pred.shape == neg_pred.shape == pos_true.shape == neg_true.shape and pos_pred.ndim == 1):
+        raise ValueError(
+            f"Shape mismatch in calc_acc: pos_pred={pos_pred.shape}, neg_pred={neg_pred.shape}, "
+            f"pos_true={pos_true.shape}, neg_true={neg_true.shape}, ndim={pos_pred.ndim}"
+        )
     if pos_pred.shape[0] == 0:
         return {
             "precision": 0.0,
@@ -890,7 +894,11 @@ def process_sequences_on_gpu(
         for h in range(num_heads):
             labels = [id2label[i] for i in preds_per_head[h].tolist()]
             annot = "".join(LABEL2CHAR[l] for l in labels)
-            assert len(annot) == len(seq)
+            if len(annot) != len(seq):
+                raise RuntimeError(
+                    f"Annotation length {len(annot)} != sequence length {len(seq)} "
+                    f"for sequence '{header}' head {h}"
+                )
             annotations_per_head[h][seq_idx] = annot
 
     def postprocess_collector() -> None:
