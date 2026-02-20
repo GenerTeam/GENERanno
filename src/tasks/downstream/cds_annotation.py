@@ -1009,7 +1009,7 @@ def process_sequences_on_gpu(
     finally:
         if enable_postprocess:
             assert postprocess_executor is not None
-            postprocess_executor.shutdown(wait=True, cancel_futures=False)
+            postprocess_executor.shutdown(wait=False, cancel_futures=True)
 
     gpu_annotated_records: List[List[Tuple[str, str]]] = [[] for _ in range(num_heads)]
     for h in range(num_heads):
