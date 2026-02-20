@@ -1329,7 +1329,19 @@ def annotate_fasta(
         progress_thread.start()
         try:
             while received_results < expected_results:
-                state, result_job_id, result_gpu_id, payload = result_queue.get()
+                try:
+                    state, result_job_id, result_gpu_id, payload = result_queue.get(timeout=30)
+                except queue.Empty:
+                    dead_workers = [
+                        i for i, p in enumerate(runtime["processes"])
+                        if not p.is_alive()
+                    ]
+                    if dead_workers:
+                        raise RuntimeError(
+                            f"Worker process(es) on GPU {dead_workers} died unexpectedly, "
+                            f"exit codes: {[runtime['processes'][i].exitcode for i in dead_workers]}"
+                        )
+                    continue
                 if state == "error":
                     raise RuntimeError(f"Worker error on GPU {result_gpu_id}: {payload}")
                 if result_job_id != job_id:
