@@ -293,7 +293,7 @@ def find_largest_downstep_top(
                 best_top = top
                 best_drop_abs = drop_abs
     else:
-        for top in range(r, l - 1, -1):
+        for top in range(r, max(l, 1) - 1, -1):
             if stop_run > 0 and values[top] <= low_thr:
                 low_cnt += 1
                 if low_cnt >= stop_run:
@@ -443,7 +443,7 @@ def setup_model_for_gpu(
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name, dtype=getattr(torch, dtype_str), trust_remote_code=True
+        model_name, torch_dtype=getattr(torch, dtype_str), trust_remote_code=True
     )
 
     device = torch.device(f"cuda:{gpu_id}" if gpu_id >= 0 else "cpu")
@@ -1306,8 +1306,7 @@ def annotate_fasta(
             interrupted = True
             raise
         finally:
-            if interrupted:
-                progress_event_queue.put("stop")
+            progress_event_queue.put("stop")
             progress_thread.join()
 
         print("🔗 Combining results from all GPUs...")
