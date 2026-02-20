@@ -1465,6 +1465,8 @@ def main() -> None:
         raise RuntimeError("No CUDA devices available.")
     if args.gpu_count == -1:
         gpu_count = available_gpus
+    elif args.gpu_count <= 0:
+        raise ValueError(f"--gpu_count must be -1 (all GPUs) or a positive integer, got {args.gpu_count}")
     else:
         gpu_count = min(args.gpu_count, available_gpus)
     
