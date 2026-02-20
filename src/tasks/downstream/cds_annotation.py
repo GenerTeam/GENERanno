@@ -43,7 +43,8 @@ PRESET_DEFAULTS = {
         "postprocess_stair_inward_shift": 16,
         "postprocess_stair_stop_run": 0,
         "postprocess_stair_stop_ratio": 0.0,
-        "postprocess_min_length": 4,
+        "postprocess_min_cds_length": 4,
+        "postprocess_min_gap_length": 4,
     },
     "prokaryote": {
         "input": ["hf://datasets/GenerTeam/cds-annotation/examples/Escherichia_coli_genome.fasta"],
@@ -55,7 +56,8 @@ PRESET_DEFAULTS = {
         "postprocess_stair_inward_shift": 16,
         "postprocess_stair_stop_run": 4,
         "postprocess_stair_stop_ratio": 0.1,
-        "postprocess_min_length": 4,
+        "postprocess_min_cds_length": 4,
+        "postprocess_min_gap_length": 4,
     },
 }
 
@@ -94,7 +96,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--postprocess_stair_inward_shift", type=int, default=d["postprocess_stair_inward_shift"], help="Max inward bp shift")
     parser.add_argument("--postprocess_stair_stop_run", type=int, default=d["postprocess_stair_stop_run"], help="Stop scanning after this many consecutive low-confidence positions")
     parser.add_argument("--postprocess_stair_stop_ratio", type=float, default=d["postprocess_stair_stop_ratio"], help="Low-confidence threshold ratio relative to boundary confidence")
-    parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
+    parser.add_argument("--postprocess_min_cds_length", type=int, default=d["postprocess_min_cds_length"], help="Minimum CDS run length (1-runs) after refinement")
+    parser.add_argument("--postprocess_min_gap_length", type=int, default=d["postprocess_min_gap_length"], help="Minimum gap run length (0-runs) after refinement")
 
     # ===== Debug =====
     parser.add_argument("--no_postprocess", action="store_true", help="Disable postprocess (debug)")
@@ -206,10 +209,10 @@ def extract_intervals_from_binary(labels: np.ndarray) -> np.ndarray:
 
 
 @njit(cache=True)
-def cleanup_short_binary_runs(values: np.ndarray, min_length: int) -> np.ndarray:
+def cleanup_short_binary_runs(values: np.ndarray, min_zero_run: int, min_one_run: int) -> np.ndarray:
     """
-    1) Fill internal 0-runs shorter than min_length (edge 0-runs kept).
-    2) Remove 1-runs shorter than min_length.
+    1) Fill internal 0-runs shorter than min_zero_run (edge 0-runs kept).
+    2) Remove 1-runs shorter than min_one_run.
     """
     if values.ndim != 1:
         raise ValueError("values must be 1D")
@@ -217,34 +220,35 @@ def cleanup_short_binary_runs(values: np.ndarray, min_length: int) -> np.ndarray
     if n == 0:
         return np.empty((0,), dtype=np.int64)
 
-    m = min_length
     out = (values.astype(np.int8) != 0).astype(np.int8)
-    if m <= 1:
+    if min_zero_run <= 1 and min_one_run <= 1:
         return out.astype(np.int64)
 
-    i = 0
-    while i < n:
-        if out[i] != 0:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and out[j] == 0:
-            j += 1
-        if i > 0 and j < n and (j - i) < m:
-            out[i:j] = 1
-        i = j
+    if min_zero_run > 1:
+        i = 0
+        while i < n:
+            if out[i] != 0:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and out[j] == 0:
+                j += 1
+            if i > 0 and j < n and (j - i) < min_zero_run:
+                out[i:j] = 1
+            i = j
 
-    i = 0
-    while i < n:
-        if out[i] != 1:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and out[j] == 1:
-            j += 1
-        if (j - i) < m:
-            out[i:j] = 0
-        i = j
+    if min_one_run > 1:
+        i = 0
+        while i < n:
+            if out[i] != 1:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and out[j] == 1:
+                j += 1
+            if (j - i) < min_one_run:
+                out[i:j] = 0
+            i = j
 
     return out.astype(np.int64)
 
@@ -401,7 +405,8 @@ def postprocess_sequence_predictions(
     postprocess_stair_inward_shift: int,
     postprocess_stair_stop_run: int,
     postprocess_stair_stop_ratio: float,
-    postprocess_min_length: int,
+    postprocess_min_cds_length: int,
+    postprocess_min_gap_length: int,
 ) -> Tuple[int, List[np.ndarray]]:
     refined_preds_per_head: List[np.ndarray] = []
     for argmax_preds_np, class1_conf in zip(argmax_preds_per_head, class1_conf_per_head):
@@ -416,10 +421,11 @@ def postprocess_sequence_predictions(
                 stop_run=postprocess_stair_stop_run,
                 stop_ratio=postprocess_stair_stop_ratio,
             )
-            if postprocess_min_length > 1:
+            if postprocess_min_cds_length > 1 or postprocess_min_gap_length > 1:
                 final_seq_preds_np = cleanup_short_binary_runs(
                     final_seq_preds_np,
-                    min_length=postprocess_min_length,
+                    min_zero_run=postprocess_min_gap_length,
+                    min_one_run=postprocess_min_cds_length,
                 )
         refined_preds_per_head.append(final_seq_preds_np)
     return seq_idx, refined_preds_per_head
@@ -837,7 +843,8 @@ def process_sequences_on_gpu(
     postprocess_stair_inward_shift: int = 16,
     postprocess_stair_stop_run: int = 4,
     postprocess_stair_stop_ratio: float = 0.1,
-    postprocess_min_length: int = 4,
+    postprocess_min_cds_length: int = 4,
+    postprocess_min_gap_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
     Process sequences on a specific GPU.
@@ -988,7 +995,8 @@ def process_sequences_on_gpu(
                     postprocess_stair_inward_shift,
                     postprocess_stair_stop_run,
                     postprocess_stair_stop_ratio,
-                    postprocess_min_length,
+                    postprocess_min_cds_length,
+                    postprocess_min_gap_length,
                 )
                 fut.add_done_callback(notify_postprocess_done)
                 postprocess_queue.put(fut)
@@ -1022,7 +1030,8 @@ def persistent_worker_process(
     postprocess_stair_inward_shift: int,
     postprocess_stair_stop_run: int,
     postprocess_stair_stop_ratio: float,
-    postprocess_min_length: int,
+    postprocess_min_cds_length: int,
+    postprocess_min_gap_length: int,
     postprocess_workers: int,
     task_queue: mp.Queue,
     result_queue: mp.Queue,
@@ -1057,7 +1066,8 @@ def persistent_worker_process(
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
                 postprocess_stair_stop_run=postprocess_stair_stop_run,
                 postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
-                postprocess_min_length=postprocess_min_length,
+                postprocess_min_cds_length=postprocess_min_cds_length,
+                postprocess_min_gap_length=postprocess_min_gap_length,
             )
             result_queue.put(("ok", job_id, gpu_id, gpu_results))
     except KeyboardInterrupt:
@@ -1079,7 +1089,8 @@ def create_persistent_worker_runtime(
     postprocess_stair_inward_shift: int,
     postprocess_stair_stop_run: int,
     postprocess_stair_stop_ratio: float,
-    postprocess_min_length: int,
+    postprocess_min_cds_length: int,
+    postprocess_min_gap_length: int,
     cpu_count: int,
 ) -> Dict[str, object]:
     cpu_budget = int(cpu_count)
@@ -1119,7 +1130,8 @@ def create_persistent_worker_runtime(
                 postprocess_stair_inward_shift,
                 postprocess_stair_stop_run,
                 postprocess_stair_stop_ratio,
-                postprocess_min_length,
+                postprocess_min_cds_length,
+                postprocess_min_gap_length,
                 post_workers_per_gpu[gpu_id],
                 task_queues[gpu_id],
                 result_queue,
@@ -1178,7 +1190,8 @@ def annotate_fasta(
     postprocess_stair_inward_shift: int = 16,
     postprocess_stair_stop_run: int = 4,
     postprocess_stair_stop_ratio: float = 0.1,
-    postprocess_min_length: int = 4,
+    postprocess_min_cds_length: int = 4,
+    postprocess_min_gap_length: int = 4,
     cpu_count: int = max(1, int((os.cpu_count() or 1) * 0.8)),
     persistent_runtime: Optional[Dict[str, object]] = None,
 ) -> List[List[Tuple[str, str]]]:
@@ -1212,7 +1225,8 @@ def annotate_fasta(
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
             postprocess_stair_stop_run=postprocess_stair_stop_run,
             postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
-            postprocess_min_length=postprocess_min_length,
+            postprocess_min_cds_length=postprocess_min_cds_length,
+            postprocess_min_gap_length=postprocess_min_gap_length,
             cpu_count=cpu_count,
         )
         owns_runtime = True
@@ -1463,7 +1477,8 @@ def main() -> None:
     postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
     postprocess_stair_stop_run = args.postprocess_stair_stop_run
     postprocess_stair_stop_ratio = args.postprocess_stair_stop_ratio
-    postprocess_min_length = args.postprocess_min_length
+    postprocess_min_cds_length = args.postprocess_min_cds_length
+    postprocess_min_gap_length = args.postprocess_min_gap_length
     cpu_count = args.cpu_count
 
     if enable_postprocess:
@@ -1473,7 +1488,8 @@ def main() -> None:
             f"inward_shift={postprocess_stair_inward_shift}, "
             f"stop_run={postprocess_stair_stop_run}, "
             f"stop_ratio={postprocess_stair_stop_ratio}, "
-            f"min_length={postprocess_min_length}, "
+            f"min_cds_length={postprocess_min_cds_length}, "
+            f"min_gap_length={postprocess_min_gap_length}, "
             f"cpu_count={cpu_count}"
         )
     else:
@@ -1508,7 +1524,8 @@ def main() -> None:
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
                 postprocess_stair_stop_run=postprocess_stair_stop_run,
                 postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
-                postprocess_min_length=postprocess_min_length,
+                postprocess_min_cds_length=postprocess_min_cds_length,
+                postprocess_min_gap_length=postprocess_min_gap_length,
                 cpu_count=cpu_count,
             )
 
@@ -1535,7 +1552,8 @@ def main() -> None:
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
                 postprocess_stair_stop_run=postprocess_stair_stop_run,
                 postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
-                postprocess_min_length=postprocess_min_length,
+                postprocess_min_cds_length=postprocess_min_cds_length,
+                postprocess_min_gap_length=postprocess_min_gap_length,
                 cpu_count=cpu_count,
                 persistent_runtime=persistent_runtime,
             )
