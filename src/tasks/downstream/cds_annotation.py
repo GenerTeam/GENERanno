@@ -2,13 +2,13 @@ import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 import datetime
 import signal
 import threading
 import queue
 import time
-from typing import Dict, IO, List, Optional, Tuple, Union
+from typing import Any, Dict, IO, List, Optional, Tuple, Union
 
 import pandas as pd
 import torch
@@ -626,7 +626,7 @@ def resolve_parquet_input_paths(input_items: List[str]) -> List[str]:
 
 def read_sequences_from_parquet(
     path: str, limit: Union[int, None] = None
-) -> Tuple[List[Tuple[str, str]], Union[List[str], None]]:
+) -> Tuple[List[Tuple[str, str]], Union[List[Any], None]]:
     """
     Read sequences from a Parquet file.
 
@@ -777,7 +777,7 @@ def write_parquet(
         record_name = (
             header[1:].split()[0] if header.startswith(">") else header.split()[0]
         )
-        row_data = {"record_name": record_name}
+        row_data: Dict[str, Any] = {"record_name": record_name}
 
         # Optionally include original sequence in parquet output
         if seq_list is not None:
@@ -879,7 +879,7 @@ def process_sequences_on_gpu(
     def update_infer_progress() -> None:
         progress_event_queue.put("infer")
 
-    def notify_postprocess_done(fut: object) -> None:
+    def notify_postprocess_done(fut: "Future[Any]") -> None:
         if fut.cancelled():
             return
         if fut.exception() is None:
@@ -1092,7 +1092,7 @@ def create_persistent_worker_runtime(
     postprocess_min_cds_length: int,
     postprocess_min_gap_length: int,
     cpu_count: int,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     cpu_budget = int(cpu_count)
     post_workers_total = 0
     post_workers_per_gpu = [0] * gpu_count
@@ -1151,7 +1151,7 @@ def create_persistent_worker_runtime(
     }
 
 
-def shutdown_persistent_worker_runtime(runtime: Dict[str, object], interrupted: bool = False) -> None:
+def shutdown_persistent_worker_runtime(runtime: Dict[str, Any], interrupted: bool = False) -> None:
     task_queues = runtime["task_queues"]
     result_queue = runtime["result_queue"]
     progress_event_queue = runtime["progress_event_queue"]
@@ -1193,7 +1193,7 @@ def annotate_fasta(
     postprocess_min_cds_length: int = 4,
     postprocess_min_gap_length: int = 4,
     cpu_count: int = max(1, int((os.cpu_count() or 1) * 0.8)),
-    persistent_runtime: Optional[Dict[str, object]] = None,
+    persistent_runtime: Optional[Dict[str, Any]] = None,
 ) -> List[List[Tuple[str, str]]]:
     """
     Annotate sequences using single or multiple GPUs with independent model loading.
@@ -1339,7 +1339,7 @@ def display_progress_header() -> None:
 
 def read_input_records(
     input_path: str, limit: Optional[int]
-) -> Tuple[List[Tuple[str, str]], Optional[List[object]]]:
+) -> Tuple[List[Tuple[str, str]], Optional[List[Any]]]:
     print("🔄 Reading input file...")
     input_format = detect_input_format(input_path)
     if input_format == "parquet":
@@ -1432,7 +1432,7 @@ def calculate_metrics_for_input(
     return metrics
 
 
-def flush_metrics_csv(metrics_rows: List[Dict[str, object]], metrics_path: str) -> None:
+def flush_metrics_csv(metrics_rows: List[Dict[str, Any]], metrics_path: str) -> None:
     if not metrics_rows:
         return
     df_metrics_all = pd.DataFrame(metrics_rows).set_index("input_name")
@@ -1502,10 +1502,10 @@ def main() -> None:
     os.makedirs(args.output_path, exist_ok=True)
 
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    metrics_rows: List[Dict[str, object]] = []
+    metrics_rows: List[Dict[str, Any]] = []
     metrics_path = os.path.join(args.output_path, f"metrics_{run_timestamp}.csv")
 
-    persistent_runtime: Optional[Dict[str, object]] = None
+    persistent_runtime: Optional[Dict[str, Any]] = None
     interrupted = False
     try:
         if gpu_count > 0:
