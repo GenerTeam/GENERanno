@@ -1195,8 +1195,13 @@ def shutdown_persistent_worker_runtime(runtime: Dict[str, Any], interrupted: boo
         for task_queue in task_queues:
             task_queue.put(None)
 
+    deadline = time.monotonic() + 30
     for p in processes:
-        p.join()
+        p.join(timeout=max(0, deadline - time.monotonic()))
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+            p.join()
 
     for q in task_queues:
         q.close()
