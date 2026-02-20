@@ -40,6 +40,8 @@ PRESET_DEFAULTS = {
         "overlap_length": 1024,
         "postprocess_stair_outward_shift": 64,
         "postprocess_stair_inward_shift": 16,
+        "postprocess_stair_stop_run": 0,
+        "postprocess_stair_stop_ratio": 0.0,
         "postprocess_min_length": 4,
     },
     "prokaryote": {
@@ -50,6 +52,8 @@ PRESET_DEFAULTS = {
         "overlap_length": 512,
         "postprocess_stair_outward_shift": 64,
         "postprocess_stair_inward_shift": 16,
+        "postprocess_stair_stop_run": 4,
+        "postprocess_stair_stop_ratio": 0.1,
         "postprocess_min_length": 4,
     },
 }
@@ -87,6 +91,8 @@ def parse_arguments() -> argparse.Namespace:
     # ===== Postprocess =====
     parser.add_argument("--postprocess_stair_outward_shift", type=int, default=d["postprocess_stair_outward_shift"], help="Max outward bp shift")
     parser.add_argument("--postprocess_stair_inward_shift", type=int, default=d["postprocess_stair_inward_shift"], help="Max inward bp shift")
+    parser.add_argument("--postprocess_stair_stop_run", type=int, default=d["postprocess_stair_stop_run"], help="Stop scanning after this many consecutive low-confidence positions")
+    parser.add_argument("--postprocess_stair_stop_ratio", type=float, default=d["postprocess_stair_stop_ratio"], help="Low-confidence threshold ratio relative to boundary confidence")
     parser.add_argument("--postprocess_min_length", type=int, default=d["postprocess_min_length"], help="Minimum run length after refinement")
 
     # ===== Debug =====
@@ -248,6 +254,9 @@ def find_largest_downstep_top(
     left: int,
     right: int,
     dir_is_right: bool = True,
+    stop_run: int = 0,
+    stop_ratio: float = 0.0,
+    base_value: float = 0.0,
 ) -> Tuple[int, float]:
     """
     Find max adjacent down-step in [left, right].
@@ -268,15 +277,29 @@ def find_largest_downstep_top(
 
     best_top = l if dir_is_right else r
     best_drop_abs = 0.0
+    low_cnt = 0
+    low_thr = base_value * stop_ratio
 
     if dir_is_right:
         for top in range(l, r):
+            if stop_run > 0 and values[top] <= low_thr:
+                low_cnt += 1
+                if low_cnt >= stop_run:
+                    break
+            else:
+                low_cnt = 0
             drop_abs = float(values[top] - values[top + 1])
             if drop_abs > best_drop_abs:
                 best_top = top
                 best_drop_abs = drop_abs
     else:
-        for top in range(l + 1, r + 1):
+        for top in range(r, l - 1, -1):
+            if stop_run > 0 and values[top] <= low_thr:
+                low_cnt += 1
+                if low_cnt >= stop_run:
+                    break
+            else:
+                low_cnt = 0
             drop_abs = float(values[top] - values[top - 1])
             if drop_abs > best_drop_abs:
                 best_top = top
@@ -291,6 +314,8 @@ def postprocess_argmax_stair_refine(
     argmax_preds: np.ndarray,
     max_shift: int = 64,
     inner_shift: int = 16,
+    stop_run: int = 4,
+    stop_ratio: float = 0.1,
 ) -> np.ndarray:
     if class1_confidence.ndim != 1:
         raise ValueError("class1_confidence must be 1D")
@@ -314,16 +339,18 @@ def postprocess_argmax_stair_refine(
         end = int(e)
         new_start = start
         new_end = end
+        start_conf = float(class1_confidence[start])
+        end_conf = float(class1_confidence[end])
 
         left_out_l = max(0, start - shift)
         left_out_r = start
         cand_start_out, drop_start_out = find_largest_downstep_top(
-            class1_confidence, left_out_l, left_out_r, False
+            class1_confidence, left_out_l, left_out_r, False, stop_run, stop_ratio, start_conf
         )
         left_in_l = start
         left_in_r = min(end, start + in_shift)
         cand_start_in, drop_start_in = find_largest_downstep_top(
-            class1_confidence, left_in_l, left_in_r, False
+            class1_confidence, left_in_l, left_in_r, False, stop_run, stop_ratio, start_conf
         )
 
         best_start = start
@@ -340,12 +367,12 @@ def postprocess_argmax_stair_refine(
         right_out_l = end
         right_out_r = min(n - 1, end + shift)
         cand_end_out, drop_end_out = find_largest_downstep_top(
-            class1_confidence, right_out_l, right_out_r, True
+            class1_confidence, right_out_l, right_out_r, True, stop_run, stop_ratio, end_conf
         )
         right_in_l = max(start, end - in_shift)
         right_in_r = end
         cand_end_in, drop_end_in = find_largest_downstep_top(
-            class1_confidence, right_in_l, right_in_r, True
+            class1_confidence, right_in_l, right_in_r, True, stop_run, stop_ratio, end_conf
         )
 
         best_end = end
@@ -371,6 +398,8 @@ def postprocess_sequence_predictions(
     class1_conf_per_head: List[Optional[np.ndarray]],
     postprocess_stair_outward_shift: int,
     postprocess_stair_inward_shift: int,
+    postprocess_stair_stop_run: int,
+    postprocess_stair_stop_ratio: float,
     postprocess_min_length: int,
 ) -> Tuple[int, List[np.ndarray]]:
     refined_preds_per_head: List[np.ndarray] = []
@@ -383,6 +412,8 @@ def postprocess_sequence_predictions(
                 argmax_preds=argmax_preds_np,
                 max_shift=postprocess_stair_outward_shift,
                 inner_shift=postprocess_stair_inward_shift,
+                stop_run=postprocess_stair_stop_run,
+                stop_ratio=postprocess_stair_stop_ratio,
             )
             if postprocess_min_length > 1:
                 final_seq_preds_np = cleanup_short_binary_runs(
@@ -803,6 +834,8 @@ def process_sequences_on_gpu(
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
+    postprocess_stair_stop_run: int = 4,
+    postprocess_stair_stop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
 ) -> List[List[Tuple[str, str]]]:
     """
@@ -960,6 +993,8 @@ def process_sequences_on_gpu(
                     class1_conf_per_head,
                     postprocess_stair_outward_shift,
                     postprocess_stair_inward_shift,
+                    postprocess_stair_stop_run,
+                    postprocess_stair_stop_ratio,
                     postprocess_min_length,
                 )
                 fut.add_done_callback(notify_postprocess_done)
@@ -993,6 +1028,8 @@ def persistent_worker_process(
     enable_postprocess: bool,
     postprocess_stair_outward_shift: int,
     postprocess_stair_inward_shift: int,
+    postprocess_stair_stop_run: int,
+    postprocess_stair_stop_ratio: float,
     postprocess_min_length: int,
     postprocess_workers: int,
     task_queue: mp.Queue,
@@ -1026,6 +1063,8 @@ def persistent_worker_process(
                 enable_postprocess=enable_postprocess,
                 postprocess_stair_outward_shift=postprocess_stair_outward_shift,
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_stair_stop_run=postprocess_stair_stop_run,
+                postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
                 postprocess_min_length=postprocess_min_length,
             )
             result_queue.put(("ok", job_id, gpu_id, gpu_results))
@@ -1046,6 +1085,8 @@ def create_persistent_worker_runtime(
     enable_postprocess: bool,
     postprocess_stair_outward_shift: int,
     postprocess_stair_inward_shift: int,
+    postprocess_stair_stop_run: int,
+    postprocess_stair_stop_ratio: float,
     postprocess_min_length: int,
     cpu_count: int,
 ) -> Dict[str, object]:
@@ -1084,6 +1125,8 @@ def create_persistent_worker_runtime(
                 enable_postprocess,
                 postprocess_stair_outward_shift,
                 postprocess_stair_inward_shift,
+                postprocess_stair_stop_run,
+                postprocess_stair_stop_ratio,
                 postprocess_min_length,
                 post_workers_per_gpu[gpu_id],
                 task_queues[gpu_id],
@@ -1141,6 +1184,8 @@ def annotate_fasta(
     enable_postprocess: bool = True,
     postprocess_stair_outward_shift: int = 64,
     postprocess_stair_inward_shift: int = 16,
+    postprocess_stair_stop_run: int = 4,
+    postprocess_stair_stop_ratio: float = 0.1,
     postprocess_min_length: int = 4,
     cpu_count: int = max(1, int((os.cpu_count() or 1) * 0.8)),
     persistent_runtime: Optional[Dict[str, object]] = None,
@@ -1173,6 +1218,8 @@ def annotate_fasta(
             enable_postprocess=enable_postprocess,
             postprocess_stair_outward_shift=postprocess_stair_outward_shift,
             postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+            postprocess_stair_stop_run=postprocess_stair_stop_run,
+            postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
             postprocess_min_length=postprocess_min_length,
             cpu_count=cpu_count,
         )
@@ -1423,6 +1470,8 @@ def main() -> None:
     enable_postprocess = not args.no_postprocess
     postprocess_stair_outward_shift = args.postprocess_stair_outward_shift
     postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
+    postprocess_stair_stop_run = args.postprocess_stair_stop_run
+    postprocess_stair_stop_ratio = args.postprocess_stair_stop_ratio
     postprocess_min_length = args.postprocess_min_length
     cpu_count = args.cpu_count
 
@@ -1431,6 +1480,8 @@ def main() -> None:
             "🎯 Postprocess enabled: "
             f"outward_shift={postprocess_stair_outward_shift}, "
             f"inward_shift={postprocess_stair_inward_shift}, "
+            f"stop_run={postprocess_stair_stop_run}, "
+            f"stop_ratio={postprocess_stair_stop_ratio}, "
             f"min_length={postprocess_min_length}, "
             f"cpu_count={cpu_count}"
         )
@@ -1464,6 +1515,8 @@ def main() -> None:
                 enable_postprocess=enable_postprocess,
                 postprocess_stair_outward_shift=postprocess_stair_outward_shift,
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_stair_stop_run=postprocess_stair_stop_run,
+                postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
                 postprocess_min_length=postprocess_min_length,
                 cpu_count=cpu_count,
             )
@@ -1489,6 +1542,8 @@ def main() -> None:
                 enable_postprocess=enable_postprocess,
                 postprocess_stair_outward_shift=postprocess_stair_outward_shift,
                 postprocess_stair_inward_shift=postprocess_stair_inward_shift,
+                postprocess_stair_stop_run=postprocess_stair_stop_run,
+                postprocess_stair_stop_ratio=postprocess_stair_stop_ratio,
                 postprocess_min_length=postprocess_min_length,
                 cpu_count=cpu_count,
                 persistent_runtime=persistent_runtime,
