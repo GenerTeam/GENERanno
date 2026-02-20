@@ -2,10 +2,11 @@ import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import ProcessPoolExecutor
 import datetime
 import signal
 import threading
+import queue
 import time
 from typing import Dict, IO, List, Optional, Tuple, Union
 
@@ -862,9 +863,11 @@ def process_sequences_on_gpu(
     num_sequences = len(sequences)
     annotations_per_head = [[""] * num_sequences for _ in range(num_heads)]
     postprocess_executor: Optional[ProcessPoolExecutor] = None
-    pending_post_futures: set[object] = set()
+    postprocess_queue: Optional[queue.Queue] = None
+    postprocess_thread: Optional[threading.Thread] = None
     if enable_postprocess:
         postprocess_executor = ProcessPoolExecutor(max_workers=postprocess_workers)
+        postprocess_queue = queue.Queue()
 
     def update_infer_progress() -> None:
         progress_event_queue.put("infer")
@@ -883,25 +886,17 @@ def process_sequences_on_gpu(
             assert len(annot) == len(seq)
             annotations_per_head[h][seq_idx] = annot
 
-    def collect_postprocess_result(block: bool = False) -> bool:
-        if not pending_post_futures:
-            return False
-        future_list = list(pending_post_futures)
-        if block:
-            done, _ = wait(future_list, return_when=FIRST_COMPLETED)
-        else:
-            done, _ = wait(future_list, timeout=0.0, return_when=FIRST_COMPLETED)
-        if not done:
-            return False
-        for fut in done:
-            pending_post_futures.discard(fut)
+    def postprocess_collector() -> None:
+        while True:
+            fut = postprocess_queue.get()
+            if fut is None:
+                break
             seq_idx, final_preds_per_head = fut.result()
             assign_sequence_annotations(seq_idx, final_preds_per_head)
-        return True
 
-    def pump_postprocess_nonblocking() -> None:
-        while collect_postprocess_result(block=False):
-            pass
+    if enable_postprocess:
+        postprocess_thread = threading.Thread(target=postprocess_collector, daemon=True)
+        postprocess_thread.start()
 
     try:
         for seq_idx, (_, seq) in enumerate(sequences):
@@ -959,8 +954,6 @@ def process_sequences_on_gpu(
                     chunk_probs_all_heads = chunk_probs_all_heads.view(num_heads, valid_len, -1)
                     for h in range(num_heads):
                         probs_per_head_chunks[h].append(chunk_probs_all_heads[h])
-                if enable_postprocess:
-                    pump_postprocess_nonblocking()
 
             argmax_preds_per_head: List[np.ndarray] = []
             class1_conf_per_head: List[Optional[np.ndarray]] = []
@@ -998,14 +991,13 @@ def process_sequences_on_gpu(
                     postprocess_min_length,
                 )
                 fut.add_done_callback(notify_postprocess_done)
-                pending_post_futures.add(fut)
-                pump_postprocess_nonblocking()
+                postprocess_queue.put(fut)
             else:
                 assign_sequence_annotations(seq_idx, argmax_preds_per_head)
 
-            if enable_postprocess:
-                while pending_post_futures:
-                    collect_postprocess_result(block=True)
+        if enable_postprocess:
+            postprocess_queue.put(None)
+            postprocess_thread.join()
     finally:
         if enable_postprocess:
             assert postprocess_executor is not None
