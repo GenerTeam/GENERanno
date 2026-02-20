@@ -876,6 +876,7 @@ def process_sequences_on_gpu(
     postprocess_executor: Optional[ProcessPoolExecutor] = None
     postprocess_queue: Optional[queue.Queue] = None
     postprocess_thread: Optional[threading.Thread] = None
+    collector_errors: List[Exception] = []
     if enable_postprocess:
         postprocess_executor = ProcessPoolExecutor(max_workers=postprocess_workers)
         postprocess_queue = queue.Queue()
@@ -906,8 +907,12 @@ def process_sequences_on_gpu(
             fut = postprocess_queue.get()
             if fut is None:
                 break
-            seq_idx, final_preds_per_head = fut.result()
-            assign_sequence_annotations(seq_idx, final_preds_per_head)
+            try:
+                seq_idx, final_preds_per_head = fut.result()
+                assign_sequence_annotations(seq_idx, final_preds_per_head)
+            except Exception as e:
+                collector_errors.append(e)
+                print(f"❌ Postprocess collector error: {e}")
 
     if enable_postprocess:
         postprocess_thread = threading.Thread(target=postprocess_collector, daemon=True)
@@ -1014,6 +1019,11 @@ def process_sequences_on_gpu(
         if enable_postprocess:
             postprocess_queue.put(None)
             postprocess_thread.join()
+            if collector_errors:
+                raise RuntimeError(
+                    f"Postprocess collector encountered {len(collector_errors)} error(s), "
+                    f"first: {collector_errors[0]}"
+                ) from collector_errors[0]
     finally:
         if enable_postprocess:
             assert postprocess_executor is not None
