@@ -1282,15 +1282,13 @@ def annotate_fasta(
                     mininterval=0.0,
                 )
 
-            while infer_pbar.n < infer_pbar.total or (
-                post_pbar is not None and post_pbar.n < post_pbar.total
-            ):
+            while True:
                 event_type = progress_event_queue.get()
                 if event_type == "stop":
                     break
                 if event_type == "infer":
                     infer_pbar.update(1)
-                elif event_type == "post":
+                elif event_type == "post" and post_pbar is not None:
                     post_pbar.update(1)
             
             infer_pbar.close()
