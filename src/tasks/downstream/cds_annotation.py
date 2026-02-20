@@ -1436,6 +1436,9 @@ def calculate_metrics_for_input(
 
         label = np.asarray(ground_truth_labels[i])
         seq_len = len(pos_pred)
+        assert len(label) == 2 * seq_len, (
+            f"Label length {len(label)} != 2 * seq_len {2 * seq_len} for record {i}"
+        )
         pos_true = label[:seq_len].astype(np.int8, copy=False)
         neg_true = label[seq_len:].astype(np.int8, copy=False)
 
