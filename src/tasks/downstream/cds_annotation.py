@@ -1472,6 +1472,12 @@ def main() -> None:
     
     print(f"🎯 Using {gpu_count} GPU(s) out of {available_gpus} available")
 
+    if args.overlap_length >= args.context_length:
+        raise ValueError(
+            f"--overlap_length ({args.overlap_length}) must be strictly less than "
+            f"--context_length ({args.context_length})"
+        )
+
     enable_postprocess = not args.no_postprocess
     postprocess_stair_outward_shift = args.postprocess_stair_outward_shift
     postprocess_stair_inward_shift = args.postprocess_stair_inward_shift
