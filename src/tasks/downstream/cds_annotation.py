@@ -931,6 +931,18 @@ def process_sequences_on_gpu(
                 seq_masks.append([1] * len(chunk_seq) + [0] * pad_len)
 
             seq_work = seq
+            if len(seq) < tokenizer_k:
+                # Sequence too short for k-mer tokenization, skip with warning
+                print(
+                    f"⚠️ Sequence {seq_idx} (len={len(seq)}) is shorter than "
+                    f"tokenizer k={tokenizer_k}, assigning empty annotations"
+                )
+                for h in range(num_heads):
+                    annotations_per_head[h][seq_idx] = "-" * len(seq)
+                update_infer_progress()
+                if enable_postprocess:
+                    progress_event_queue.put("post")
+                continue
             if len(seq_work) < max_char_length:
                 chrs = seq_work[:len(seq_work) // tokenizer_k * tokenizer_k]
                 chunk_seq = tokenizer(chrs, add_special_tokens=False)["input_ids"]
