@@ -2,7 +2,7 @@ import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import argparse
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import datetime
 import signal
 import threading
@@ -895,15 +895,6 @@ def process_sequences_on_gpu(
         postprocess_executor = ProcessPoolExecutor(max_workers=postprocess_workers)
         postprocess_queue = queue.Queue()
 
-    def update_infer_progress() -> None:
-        progress_event_queue.put("infer")
-
-    def notify_postprocess_done(fut: "Future[Any]") -> None:
-        if fut.cancelled():
-            return
-        if fut.exception() is None:
-            progress_event_queue.put("post")
-
     def assign_sequence_annotations(seq_idx: int, preds_per_head: List[np.ndarray]) -> None:
         header, seq = sequences[seq_idx]
         for h in range(num_heads):
@@ -924,6 +915,7 @@ def process_sequences_on_gpu(
             try:
                 seq_idx, final_preds_per_head = fut.result()
                 assign_sequence_annotations(seq_idx, final_preds_per_head)
+                progress_event_queue.put("post")
             except Exception as e:
                 collector_errors.append(e)
                 print(f"❌ Postprocess collector error: {e}")
@@ -952,8 +944,8 @@ def process_sequences_on_gpu(
                     f"tokenizer k={tokenizer_k}, assigning empty annotations"
                 )
                 for h in range(num_heads):
-                    annotations_per_head[h][seq_idx] = "-" * len(seq)
-                update_infer_progress()
+                    annotations_per_head[h][seq_idx] = LABEL2CHAR["NON_CODING"] * len(seq)
+                progress_event_queue.put("infer")
                 if enable_postprocess:
                     progress_event_queue.put("post")
                 continue
@@ -1022,7 +1014,7 @@ def process_sequences_on_gpu(
                 else:
                     class1_conf_per_head.append(None)
 
-            update_infer_progress()
+            progress_event_queue.put("infer")
             if enable_postprocess:
                 assert postprocess_executor is not None
                 fut = postprocess_executor.submit(
@@ -1037,7 +1029,6 @@ def process_sequences_on_gpu(
                     postprocess_min_cds_length,
                     postprocess_min_gap_length,
                 )
-                fut.add_done_callback(notify_postprocess_done)
                 postprocess_queue.put(fut)
             else:
                 assign_sequence_annotations(seq_idx, argmax_preds_per_head)
