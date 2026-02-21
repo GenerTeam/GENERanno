@@ -126,56 +126,46 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
             f"pos_true={pos_true.shape}, neg_true={neg_true.shape}, ndim={pos_pred.ndim}"
         )
     if pos_pred.shape[0] == 0:
-        return {
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "start_precision": 0.0,
-            "start_recall": 0.0,
-            "start_f1": 0.0,
-            "end_precision": 0.0,
-            "end_recall": 0.0,
-            "end_f1": 0.0,
-            "boundary_precision": 0.0,
-            "boundary_recall": 0.0,
-            "boundary_f1": 0.0,
-            "exact_match": 0.0
-        }
-    
-    pred = np.stack([pos_pred, neg_pred], axis=0) != 0
-    true = np.stack([pos_true, neg_true], axis=0) != 0
+        precision = recall = f1 = 0.0
+        start_precision = start_recall = start_f1 = 0.0
+        end_precision = end_recall = end_f1 = 0.0
+        boundary_precision = boundary_recall = boundary_f1 = 0.0
+        exact_match = 0.0
+    else:
+        pred = np.stack([pos_pred, neg_pred], axis=0) != 0
+        true = np.stack([pos_true, neg_true], axis=0) != 0
 
-    precision, recall, f1 = calc(pred.ravel(), true.ravel())
-    
-    pred = np.column_stack((np.zeros((2, 1), dtype=bool), pred, np.zeros((2, 1), dtype=bool)))
-    true = np.column_stack((np.zeros((2, 1), dtype=bool), true, np.zeros((2, 1), dtype=bool)))
+        precision, recall, f1 = calc(pred.ravel(), true.ravel())
 
-    dp = np.diff(pred.astype(np.int8).ravel())
-    dt = np.diff(true.astype(np.int8).ravel())
-    sp = np.cumsum(pred.astype(int), axis=1).ravel()
-    st = np.cumsum(true.astype(int), axis=1).ravel()
-    
-    start_precision, start_recall, start_f1 = calc(dp == 1, dt == 1)
-    end_precision, end_recall, end_f1 = calc(dp == -1, dt == -1)
+        pred = np.column_stack((np.zeros((2, 1), dtype=bool), pred, np.zeros((2, 1), dtype=bool)))
+        true = np.column_stack((np.zeros((2, 1), dtype=bool), true, np.zeros((2, 1), dtype=bool)))
 
-    true_start_indices = np.nonzero(dt == 1)[0]
-    true_end_indices = np.nonzero(dt == -1)[0]
-    true_rng = np.stack((true_start_indices, true_end_indices), axis=1)
-    pred_start_indices = np.nonzero(dp == 1)[0]
-    pred_end_indices = np.nonzero(dp == -1)[0]
-    pred_rng = np.stack((pred_start_indices, pred_end_indices), axis=1)
+        dp = np.diff(pred.astype(np.int8).ravel())
+        dt = np.diff(true.astype(np.int8).ravel())
+        sp = np.cumsum(pred.astype(int), axis=1).ravel()
+        st = np.cumsum(true.astype(int), axis=1).ravel()
 
-    boundary_precision = (dt[pred_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(pred_rng) > 0 else 0.0
-    boundary_recall = (dp[true_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(true_rng) > 0 else 0.0
-    boundary_f1 = (
-        2 * boundary_precision * boundary_recall / (boundary_precision + boundary_recall)
-        if (boundary_precision + boundary_recall) > 0 else 0.0
-    )
+        start_precision, start_recall, start_f1 = calc(dp == 1, dt == 1)
+        end_precision, end_recall, end_f1 = calc(dp == -1, dt == -1)
 
-    exact_match = (
-        (dp[true_rng] == np.array([1, -1])).all(axis=1) &
-        (np.diff(sp[true_rng + 1], axis=1) == np.diff(st[true_rng + 1], axis=1)).flatten()
-    ).mean().item() if len(true_rng) > 0 else 0.0
+        true_start_indices = np.nonzero(dt == 1)[0]
+        true_end_indices = np.nonzero(dt == -1)[0]
+        true_rng = np.stack((true_start_indices, true_end_indices), axis=1)
+        pred_start_indices = np.nonzero(dp == 1)[0]
+        pred_end_indices = np.nonzero(dp == -1)[0]
+        pred_rng = np.stack((pred_start_indices, pred_end_indices), axis=1)
+
+        boundary_precision = (dt[pred_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(pred_rng) > 0 else 0.0
+        boundary_recall = (dp[true_rng] == np.array([1, -1])).all(axis=1).mean().item() if len(true_rng) > 0 else 0.0
+        boundary_f1 = (
+            2 * boundary_precision * boundary_recall / (boundary_precision + boundary_recall)
+            if (boundary_precision + boundary_recall) > 0 else 0.0
+        )
+
+        exact_match = (
+            (dp[true_rng] == np.array([1, -1])).all(axis=1) &
+            (np.diff(sp[true_rng + 1], axis=1) == np.diff(st[true_rng + 1], axis=1)).flatten()
+        ).mean().item() if len(true_rng) > 0 else 0.0
 
     return {
         "precision": precision,
