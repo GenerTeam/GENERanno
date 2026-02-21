@@ -698,36 +698,20 @@ def read_sequences_from_parquet(
                     f"for row {i} in '{path}'"
                 )
         print("✅ Found ground truth labels in 'label_cds' column")
-    elif "label_plus" in df.columns and "label_minus" in df.columns:
-        lp, lm = df["label_plus"].tolist(), df["label_minus"].tolist()
-        for i, (p, m, seq) in enumerate(zip(lp, lm, sequences)):
-            if len(p) != len(seq):
-                raise ValueError(
-                    f"'label_plus' length {len(p)} != sequence length {len(seq)} "
-                    f"for row {i} in '{path}'"
-                )
-            if len(m) != len(seq):
-                raise ValueError(
-                    f"'label_minus' length {len(m)} != sequence length {len(seq)} "
-                    f"for row {i} in '{path}'"
-                )
-        labels = [np.concatenate([x, y]) for x, y in zip(lp, lm)]
-        print("✅ Found ground truth labels in 'label_plus' and 'label_minus' columns")
-    elif "label+" in df.columns and "label-" in df.columns:
-        lp, lm = df["label+"].tolist(), df["label-"].tolist()
-        for i, (p, m, seq) in enumerate(zip(lp, lm, sequences)):
-            if len(p) != len(seq):
-                raise ValueError(
-                    f"'label+' length {len(p)} != sequence length {len(seq)} "
-                    f"for row {i} in '{path}'"
-                )
-            if len(m) != len(seq):
-                raise ValueError(
-                    f"'label-' length {len(m)} != sequence length {len(seq)} "
-                    f"for row {i} in '{path}'"
-                )
-        labels = [np.concatenate([x, y]) for x, y in zip(lp, lm)]
-        print("✅ Found ground truth labels in 'label+' and 'label-' columns")
+    else:
+        for plus_col, minus_col in [("label_plus", "label_minus"), ("label+", "label-")]:
+            if plus_col in df.columns and minus_col in df.columns:
+                lp, lm = df[plus_col].tolist(), df[minus_col].tolist()
+                for i, (p, m, seq) in enumerate(zip(lp, lm, sequences)):
+                    for col, lbl in [(plus_col, p), (minus_col, m)]:
+                        if len(lbl) != len(seq):
+                            raise ValueError(
+                                f"'{col}' length {len(lbl)} != sequence length {len(seq)} "
+                                f"for row {i} in '{path}'"
+                            )
+                labels = [np.concatenate([x, y]) for x, y in zip(lp, lm)]
+                print(f"✅ Found ground truth labels in '{plus_col}' and '{minus_col}' columns")
+                break
 
     records: List[Tuple[str, str]] = []
     for i, (seq, header_val) in enumerate(zip(sequences, headers)):
