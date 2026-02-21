@@ -52,7 +52,7 @@ PRESET_DEFAULTS = {
         "output_path": "./prokaryote_annotation_results",
         "context_length": 8192,
         "overlap_length": 512,
-        "postprocess_stair_outward_shift": 64,
+        "postprocess_stair_outward_shift": 128,
         "postprocess_stair_inward_shift": 16,
         "postprocess_stair_stop_run": 4,
         "postprocess_stair_stop_ratio": 0.1,
