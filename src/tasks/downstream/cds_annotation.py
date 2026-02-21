@@ -130,7 +130,7 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
         start_precision = start_recall = start_f1 = 0.0
         end_precision = end_recall = end_f1 = 0.0
         boundary_precision = boundary_recall = boundary_f1 = 0.0
-        exact_match = 0.0
+        exact_precision = exact_recall = exact_f1 = 0.0
     else:
         pred = np.stack([pos_pred, neg_pred], axis=0) != 0
         true = np.stack([pos_true, neg_true], axis=0) != 0
@@ -162,10 +162,18 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
             if (boundary_precision + boundary_recall) > 0 else 0.0
         )
 
-        exact_match = (
+        exact_recall = (
             (dp[true_rng] == np.array([1, -1])).all(axis=1) &
             (np.diff(sp[true_rng + 1], axis=1) == np.diff(st[true_rng + 1], axis=1)).flatten()
         ).mean().item() if len(true_rng) > 0 else 0.0
+        exact_precision = (
+            (dt[pred_rng] == np.array([1, -1])).all(axis=1) &
+            (np.diff(st[pred_rng + 1], axis=1) == np.diff(sp[pred_rng + 1], axis=1)).flatten()
+        ).mean().item() if len(pred_rng) > 0 else 0.0
+        exact_f1 = (
+            2 * exact_precision * exact_recall / (exact_precision + exact_recall)
+            if (exact_precision + exact_recall) > 0 else 0.0
+        )
 
     return {
         "precision": precision,
@@ -180,7 +188,9 @@ def calc_acc(pos_pred, neg_pred, pos_true, neg_true):
         "boundary_precision": boundary_precision,
         "boundary_recall": boundary_recall,
         "boundary_f1": boundary_f1,
-        "exact_match": exact_match
+        "exact_precision": exact_precision,
+        "exact_recall": exact_recall,
+        "exact_f1": exact_f1,
     }
 
 
