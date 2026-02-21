@@ -691,12 +691,42 @@ def read_sequences_from_parquet(
     labels = None
     if "label_cds" in df.columns:
         labels = df["label_cds"].tolist()
+        for i, (lbl, seq) in enumerate(zip(labels, sequences)):
+            if len(lbl) != 2 * len(seq):
+                raise ValueError(
+                    f"'label_cds' length {len(lbl)} != 2 * sequence length {len(seq)} "
+                    f"for row {i} in '{path}'"
+                )
         print("✅ Found ground truth labels in 'label_cds' column")
     elif "label_plus" in df.columns and "label_minus" in df.columns:
-        labels = [np.concatenate([x, y]) for x, y in zip(df["label_plus"].tolist(), df["label_minus"].tolist())]
+        lp, lm = df["label_plus"].tolist(), df["label_minus"].tolist()
+        for i, (p, m, seq) in enumerate(zip(lp, lm, sequences)):
+            if len(p) != len(seq):
+                raise ValueError(
+                    f"'label_plus' length {len(p)} != sequence length {len(seq)} "
+                    f"for row {i} in '{path}'"
+                )
+            if len(m) != len(seq):
+                raise ValueError(
+                    f"'label_minus' length {len(m)} != sequence length {len(seq)} "
+                    f"for row {i} in '{path}'"
+                )
+        labels = [np.concatenate([x, y]) for x, y in zip(lp, lm)]
         print("✅ Found ground truth labels in 'label_plus' and 'label_minus' columns")
     elif "label+" in df.columns and "label-" in df.columns:
-        labels = [np.concatenate([x, y]) for x, y in zip(df["label+"].tolist(), df["label-"].tolist())]
+        lp, lm = df["label+"].tolist(), df["label-"].tolist()
+        for i, (p, m, seq) in enumerate(zip(lp, lm, sequences)):
+            if len(p) != len(seq):
+                raise ValueError(
+                    f"'label+' length {len(p)} != sequence length {len(seq)} "
+                    f"for row {i} in '{path}'"
+                )
+            if len(m) != len(seq):
+                raise ValueError(
+                    f"'label-' length {len(m)} != sequence length {len(seq)} "
+                    f"for row {i} in '{path}'"
+                )
+        labels = [np.concatenate([x, y]) for x, y in zip(lp, lm)]
         print("✅ Found ground truth labels in 'label+' and 'label-' columns")
 
     records: List[Tuple[str, str]] = []
@@ -1453,9 +1483,6 @@ def calculate_metrics_for_input(
 
         label = np.asarray(ground_truth_labels[i])
         seq_len = len(pos_pred)
-        assert len(label) == 2 * seq_len, (
-            f"Label length {len(label)} != 2 * seq_len {2 * seq_len} for record {i}"
-        )
         pos_true = label[:seq_len].astype(np.int8, copy=False)
         neg_true = label[seq_len:].astype(np.int8, copy=False)
 
