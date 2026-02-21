@@ -1596,6 +1596,10 @@ def main() -> None:
                 input_path, limit=args.limit
             )
 
+            if not fasta_records:
+                print("⚠️ No sequences found, skipping.")
+                continue
+
             # Use unified annotate function for both single and multi-GPU
             annotated_records_per_head = annotate_fasta(
                 fasta_records,
