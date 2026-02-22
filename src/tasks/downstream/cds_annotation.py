@@ -55,7 +55,7 @@ PRESET_DEFAULTS = {
         "postprocess_stair_outward_shift": 128,
         "postprocess_stair_inward_shift": 16,
         "postprocess_stair_stop_run": 4,
-        "postprocess_stair_stop_ratio": 0.1,
+        "postprocess_stair_stop_ratio": 0.3,
         "postprocess_min_cds_length": 4,
         "postprocess_min_gap_length": 1,
     },
