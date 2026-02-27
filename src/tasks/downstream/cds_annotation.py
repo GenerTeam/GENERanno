@@ -454,7 +454,7 @@ def setup_model_for_gpu(
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForTokenClassification.from_pretrained(
-        model_name, torch_dtype=getattr(torch, dtype_str), trust_remote_code=True
+        model_name, dtype=getattr(torch, dtype_str), trust_remote_code=True
     )
 
     device = torch.device(f"cuda:{gpu_id}" if gpu_id >= 0 else "cpu")
